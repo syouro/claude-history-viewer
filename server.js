@@ -793,6 +793,30 @@ details.tool summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mdbody{padding:2px 12px 10px;max-height:360px;overflow:auto}
 .empty{color:var(--muted);text-align:center;margin-top:80px;font-size:13px}
 .mono{font-family:ui-monospace,Menlo,monospace}
+/* 移动端：侧栏折叠成抽屉 */
+#menuBtn{display:none;position:fixed;top:10px;left:10px;z-index:11;width:38px;height:38px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;
+  font-size:17px;cursor:pointer;align-items:center;justify-content:center;
+  box-shadow:0 2px 10px rgba(0,0,0,.12)}
+#scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:9}
+@media (max-width:720px){
+  #menuBtn{display:flex}
+  body.nav-open #scrim{display:block}
+  #side{position:fixed;top:0;left:0;bottom:0;z-index:10;width:min(85vw,340px);min-width:0;
+    transform:translateX(-105%);transition:transform .22s ease;box-shadow:4px 0 24px rgba(0,0,0,.18)}
+  body.nav-open #side{transform:none}
+  #side header{padding-top:14px}
+  #top{padding:12px 14px 12px 58px;flex-wrap:wrap}
+  #top h2{font-size:14.5px}
+  .tbtns{width:100%;justify-content:flex-end}
+  #chains{padding:8px 14px}
+  #conv{padding:14px 10px 70px}
+  .msg{gap:6px}
+  .who{min-width:40px;font-size:9.5px;padding-top:10px}
+  .bubble{padding:9px 11px}
+  #hitbar{right:12px;top:8px}
+  .stats .tiles{grid-template-columns:repeat(2,1fr)}
+}
 /* 子代理侧链切换 */
 #chains{display:none;gap:6px;padding:8px 22px;border-bottom:1px solid var(--line);
   background:var(--panel);flex-wrap:wrap;align-items:center}
@@ -855,6 +879,9 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     <div class="err" id="loginErr"></div>
   </div>
 </div>
+
+<button id="menuBtn" title="会话列表" style="display:none">☰</button>
+<div id="scrim"></div>
 
 <aside id="side" style="display:none">
   <header>

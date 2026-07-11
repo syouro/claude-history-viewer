@@ -255,6 +255,7 @@ async function open(s, jumpIdx) {
   syncFavUI(data);
   renderChains(data);
   renderMain(data.messages);
+  document.body.classList.remove('nav-open'); // 移动端选完会话收起抽屉
   if (jumpIdx != null) jumpToMsg(jumpIdx);
   history.replaceState(null, '', '#s=' + encodeURIComponent(data.project) + '/' +
     encodeURIComponent(data.id) + (jumpIdx != null ? '/' + jumpIdx : ''));
@@ -735,12 +736,18 @@ function initTheme() {
 // ---------- 登录 ----------
 function showLogin() {
   $('#login').style.display = 'flex'; $('#side').style.display = 'none';
-  $('#main').style.display = 'none'; setTimeout(function () { $('#pw').focus(); }, 50);
+  $('#main').style.display = 'none'; $('#menuBtn').style.display = 'none';
+  setTimeout(function () { $('#pw').focus(); }, 50);
 }
 function showApp() {
   $('#login').style.display = 'none'; $('#side').style.display = 'flex';
   $('#main').style.display = 'flex';
-  loadFavs().then(loadList).then(navFromHash);
+  $('#menuBtn').style.display = ''; // 交回 CSS 控制（桌面隐藏/移动显示）
+  loadFavs().then(loadList).then(navFromHash).then(function () {
+    // 移动端进来没有目标会话时，直接展开列表抽屉
+    if (!current && window.matchMedia('(max-width:720px)').matches)
+      document.body.classList.add('nav-open');
+  });
 }
 async function doLogin() {
   var pw = $('#pw').value; $('#loginErr').textContent = '';
@@ -768,7 +775,12 @@ $('#theme').onclick = function () {
   else document.documentElement.removeAttribute('data-theme');
   localStorage.setItem('chv-theme', next);
 };
-$('#statsBtn').onclick = openStats;
+$('#statsBtn').onclick = function () {
+  document.body.classList.remove('nav-open');
+  openStats();
+};
+$('#menuBtn').onclick = function () { document.body.classList.toggle('nav-open'); };
+$('#scrim').onclick = function () { document.body.classList.remove('nav-open'); };
 $('#loginBtn').onclick = doLogin;
 $('#pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
 $('#logout').onclick = async function () { await fetch('api/logout'); showLogin(); };
