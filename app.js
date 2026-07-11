@@ -224,10 +224,11 @@ function apiSession(s, params) {
   return fetch('api/session?project=' + encodeURIComponent(s.project) +
     '&id=' + encodeURIComponent(s.id) + (params || '')).then(function (r) { return r.json(); });
 }
-async function open(s) {
-  // 搜索模式下全量加载，保证命中定位覆盖整段会话；平时只取最近 PAGE 条
-  var full = searchMode && lastTerms.length;
+async function open(s, jumpIdx) {
+  // 搜索模式或锚点跳转时全量加载（要能定位任意位置）；平时只取最近 PAGE 条
+  var full = (searchMode && lastTerms.length) || jumpIdx != null;
   var data = await apiSession(s, full ? '&limit=0' : '&limit=' + PAGE);
+  if (data.error) return;
   current = data;
   view = { offset: data.offset, total: data.total, terms: full ? lastTerms : [],
     mode: 'main', loading: false, wrap: null, older: null };
@@ -247,9 +248,30 @@ async function open(s) {
   syncFavUI(data);
   renderChains(data);
   renderMain(data.messages);
+  if (jumpIdx != null) jumpToMsg(jumpIdx);
+  history.replaceState(null, '', '#s=' + encodeURIComponent(data.project) + '/' +
+    encodeURIComponent(data.id) + (jumpIdx != null ? '/' + jumpIdx : ''));
   scheduleLive();
   if (searchMode) doSearch($('#q').value.trim()); else render($('#q').value.trim());
 }
+function jumpToMsg(idx) {
+  var el = $('#conv').querySelector('.msg[data-idx="' + idx + '"]');
+  if (!el) return;
+  el.scrollIntoView({ block: 'center' });
+  el.classList.add('flash');
+  setTimeout(function () { el.classList.remove('flash'); }, 2000);
+}
+// #s=项目/会话ID[/消息序号] 直达定位
+function navFromHash() {
+  var m = location.hash.match(/^#s=([^/]+)\/([^/]+)(?:\/(\d+))?$/);
+  if (!m) return;
+  var s = { project: decodeURIComponent(m[1]), id: decodeURIComponent(m[2]) };
+  var idx = m[3] === undefined ? null : +m[3];
+  if (current && current.project === s.project && current.id === s.id && idx != null &&
+      $('#conv').querySelector('.msg[data-idx="' + idx + '"]')) { jumpToMsg(idx); return; }
+  open(s, idx);
+}
+window.addEventListener('hashchange', navFromHash);
 
 // ---------- 收藏 ----------
 async function loadFavs() {
@@ -302,8 +324,8 @@ async function pollLive() {
       if (!current || delta.id !== current.id || view.mode !== 'main') return;
       var conv = $('#conv');
       var follow = conv.scrollHeight - conv.scrollTop - conv.clientHeight < 150;
-      delta.messages.forEach(function (m) {
-        if (!m.isMeta) view.wrap.appendChild(msgEl(m, view.terms));
+      delta.messages.forEach(function (m, j) {
+        if (!m.isMeta) view.wrap.appendChild(msgEl(m, view.terms, false, delta.offset + j));
       });
       view.total = meta.total;
       if (follow) conv.scrollTop = conv.scrollHeight; // 在底部时自动跟随
@@ -339,7 +361,9 @@ function renderMain(msgs) {
   older.onclick = loadOlder;
   wrap.appendChild(older);
   view.wrap = wrap; view.older = older;
-  msgs.forEach(function (m) { if (!m.isMeta) wrap.appendChild(msgEl(m, view.terms)); });
+  msgs.forEach(function (m, j) {
+    if (!m.isMeta) wrap.appendChild(msgEl(m, view.terms, false, view.offset + j));
+  });
   conv.appendChild(wrap);
   updateOlder();
   if (view.terms.length) { conv.scrollTop = 0; setupHits(); }
@@ -358,7 +382,9 @@ async function loadOlder() {
   var data = await apiSession(current, '&limit=' + PAGE + '&before=' + view.offset);
   var conv = $('#conv'), prevH = conv.scrollHeight;
   var frag = document.createDocumentFragment();
-  data.messages.forEach(function (m) { if (!m.isMeta) frag.appendChild(msgEl(m, view.terms)); });
+  data.messages.forEach(function (m, j) {
+    if (!m.isMeta) frag.appendChild(msgEl(m, view.terms, false, data.offset + j));
+  });
   view.wrap.insertBefore(frag, view.older.nextSibling);
   view.offset = data.offset;
   conv.scrollTop += conv.scrollHeight - prevH; // 保持视口不跳
@@ -489,7 +515,7 @@ function toolView(name, inp, terms) {
 }
 
 // ---------- 消息 ----------
-function msgEl(m, terms, side) {
+function msgEl(m, terms, side, idx) {
   if (m.blocks.length === 1 && m.blocks[0].kind === 'compact') {
     var dv = document.createElement('div'); dv.className = 'divider';
     dv.textContent = m.blocks[0].text; return dv;
@@ -521,9 +547,31 @@ function msgEl(m, terms, side) {
     inner = '<details class="pack block"><summary>📦 压缩摘要（续接会话的上文）</summary>' +
       '<div class="mdbody">' + inner + '</div></details>';
   }
-  el.innerHTML = '<div class="who ' + m.role + '">' + who + '</div><div class="bubble">' + inner + '</div>';
+  var anchor = '';
+  if (!side && idx !== undefined) {
+    el.dataset.idx = idx;
+    anchor = '<button class="alink" title="复制此消息的直达链接">🔗</button>';
+  }
+  el.innerHTML = '<div class="who ' + m.role + '">' + who + '</div><div class="bubble">' +
+    anchor + inner + '</div>';
   return el;
 }
+// 锚点按钮：事件委托，复制 #s= 直达链接
+$('#conv').addEventListener('click', function (e) {
+  var btn = e.target && e.target.closest ? e.target.closest('.alink') : null;
+  if (!btn || !current) return;
+  var msg = btn.closest('.msg');
+  var link = location.origin + location.pathname + '#s=' +
+    encodeURIComponent(current.project) + '/' + encodeURIComponent(current.id) +
+    '/' + msg.dataset.idx;
+  var done = function () {
+    btn.textContent = '✓';
+    setTimeout(function () { btn.textContent = '🔗'; }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(link).then(done, function () { window.prompt('复制链接：', link); });
+  else window.prompt('复制链接：', link);
+});
 
 // ---------- 搜索命中跳转 ----------
 var hits = [], hitIdx = -1;
@@ -658,7 +706,7 @@ function showLogin() {
 function showApp() {
   $('#login').style.display = 'none'; $('#side').style.display = 'flex';
   $('#main').style.display = 'flex';
-  loadFavs().then(loadList);
+  loadFavs().then(loadList).then(navFromHash);
 }
 async function doLogin() {
   var pw = $('#pw').value; $('#loginErr').textContent = '';

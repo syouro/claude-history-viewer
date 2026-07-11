@@ -716,7 +716,12 @@ mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}
 .who{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
   min-width:70px;padding-top:9px;color:var(--muted)}
 .who.user{color:var(--accent)}
-.bubble{flex:1;border:1px solid var(--line);border-radius:12px;padding:11px 14px;min-width:0}
+.bubble{flex:1;border:1px solid var(--line);border-radius:12px;padding:11px 14px;min-width:0;position:relative}
+.alink{position:absolute;top:6px;right:6px;border:1px solid var(--line);background:var(--panel);
+  border-radius:7px;font-size:11px;padding:2px 6px;cursor:pointer;display:none;color:var(--muted)}
+.msg:hover .alink{display:block}
+.alink:hover{border-color:var(--accent);color:var(--ink)}
+.msg.flash .bubble{outline:2px solid var(--accent);transition:outline-color 1.5s}
 .msg.user .bubble{background:var(--user)}
 .msg.assistant .bubble{background:var(--assist)}
 .block{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
