@@ -96,7 +96,8 @@ function parseCookies(req) {
   return out;
 }
 function isAuthed(req) {
-  return !!verifyToken(parseCookies(req)['chv_sid']);
+  const p = verifyToken(parseCookies(req)['chv_sid']);
+  return !!p && !p.sp; // 分享 token（带会话作用域）不能冒充登录会话
 }
 
 // ---------- 登录限速 ----------
@@ -512,12 +513,17 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, { ok: true }); return;
     }
 
-    // 以下均需鉴权
-    if (!isAuthed(req)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
+    // 鉴权：登录会话，或限定单个会话的只读分享 token（?share=）
+    const authed = isAuthed(req);
+    const shareTok = url.searchParams.get('share');
+    const share = shareTok ? verifyToken(shareTok) : null; // {sp, si, exp}
+    const canRead = (project, id) =>
+      authed || (!!share && share.sp === project && share.si === id);
 
-    if (p === '/api/sessions') { sendJSON(res, listAll()); return; }
     if (p === '/api/session') {
-      const s = loadSession(url.searchParams.get('project'), url.searchParams.get('id'));
+      const project = url.searchParams.get('project'), id = url.searchParams.get('id');
+      if (!canRead(project, id)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
+      const s = loadSession(project, id);
       if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
       // meta=1：只回元信息（供实时轮询比对），不带消息体
       if (url.searchParams.get('meta') === '1') {
@@ -541,11 +547,42 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/sidechain') {
-      const s = loadSession(url.searchParams.get('project'), url.searchParams.get('id'));
+      const project = url.searchParams.get('project'), id = url.searchParams.get('id');
+      if (!canRead(project, id)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
+      const s = loadSession(project, id);
       if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
       const sc = s.sidechains.find((x) => x.agentId === url.searchParams.get('agent'));
       if (!sc) { sendJSON(res, { error: 'not found' }, 404); return; }
       sendJSON(res, sc); return;
+    }
+    if (p === '/api/export') {
+      const project = url.searchParams.get('project'), id = url.searchParams.get('id');
+      if (!canRead(project, id)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
+      const s = loadSession(project, id);
+      if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
+      const fn = (s.title || 'session').replace(/[^\w一-龥-]+/g, '_').slice(0, 60);
+      res.writeHead(200, {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Disposition': "attachment; filename*=UTF-8''" +
+          encodeURIComponent(fn + '.md'),
+      });
+      res.end(toMarkdown(s)); return;
+    }
+
+    // 以下均需登录
+    if (!authed) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
+
+    if (p === '/api/sessions') { sendJSON(res, listAll()); return; }
+    if (p === '/api/share' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
+        sendJSON(res, { error: 'bad request' }, 400); return;
+      }
+      const days = Math.min(30, Math.max(1, +body.days || 7));
+      const exp = Date.now() + days * 86400e3;
+      sendJSON(res, { token: signToken({ sp: body.project, si: body.id, exp }), exp });
+      return;
     }
     if (p === '/api/favs') { sendJSON(res, FAVS); return; }
     if (p === '/api/fav' && req.method === 'POST') {
@@ -585,17 +622,6 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/search') {
       const inc = url.searchParams.get('thinking') === '1';
       sendJSON(res, search(url.searchParams.get('q') || '', inc)); return;
-    }
-    if (p === '/api/export') {
-      const s = loadSession(url.searchParams.get('project'), url.searchParams.get('id'));
-      if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
-      const fn = (s.title || 'session').replace(/[^\w一-龥-]+/g, '_').slice(0, 60);
-      res.writeHead(200, {
-        'Content-Type': 'text/markdown; charset=utf-8',
-        'Content-Disposition': "attachment; filename*=UTF-8''" +
-          encodeURIComponent(fn + '.md'),
-      });
-      res.end(toMarkdown(s)); return;
     }
     sendJSON(res, { error: 'not found' }, 404);
   } catch (e) {
@@ -701,9 +727,11 @@ mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}
 #top h2{margin:0;font-size:16px}
 #top .sub{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:14px;flex-wrap:wrap}
 .tbtns{display:flex;gap:8px;align-items:flex-start}
-#exp,#fav{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
+#exp,#fav,#share{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
   padding:7px 12px;font-size:12.5px;cursor:pointer;white-space:nowrap}
-#exp:hover,#fav:hover{border-color:var(--accent)}
+#exp:hover,#fav:hover,#share:hover{border-color:var(--accent)}
+.robadge{background:var(--accent-soft);color:var(--accent);border-radius:8px;
+  padding:1px 8px;font-size:11px;font-weight:600}
 #fav.on{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
 #favnote{margin-top:8px;width:min(420px,100%);padding:6px 10px;border:1px solid var(--line);
   border-radius:8px;background:var(--field);color:var(--ink);font-size:12px;outline:none}
@@ -856,6 +884,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   <div id="top"><div style="min-width:0;flex:1"><h2 id="ttl"></h2><div class="sub" id="sub"></div>
       <input id="favnote" placeholder="收藏备注，回车保存" style="display:none"></div>
     <div class="tbtns"><button id="fav" title="收藏">☆</button>
+      <button id="share" title="生成 7 天有效的只读分享链接">分享</button>
       <button id="exp">导出 MD</button></div></div>
   <div id="chains"></div>
   <div id="hitbar"><span id="hitn"></span>

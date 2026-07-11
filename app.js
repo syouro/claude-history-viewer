@@ -1,7 +1,9 @@
 'use strict';
 var $ = function (s) { return document.querySelector(s); };
 var sessions = [], current = null, searchMode = false, lastTerms = [], favs = {};
+var SHARE = new URLSearchParams(location.search).get('share'); // 访客只读模式
 function favKey(s) { return s.project + '/' + s.id; }
+function shareQ() { return SHARE ? '&share=' + encodeURIComponent(SHARE) : ''; }
 var PAGE = 80; // 每次加载的消息条数
 
 function esc(s) {
@@ -222,7 +224,8 @@ var view = { offset: 0, total: 0, terms: [], mode: 'main', loading: false, wrap:
 
 function apiSession(s, params) {
   return fetch('api/session?project=' + encodeURIComponent(s.project) +
-    '&id=' + encodeURIComponent(s.id) + (params || '')).then(function (r) { return r.json(); });
+    '&id=' + encodeURIComponent(s.id) + shareQ() + (params || ''))
+    .then(function (r) { return r.json(); });
 }
 async function open(s, jumpIdx) {
   // 搜索模式或锚点跳转时全量加载（要能定位任意位置）；平时只取最近 PAGE 条
@@ -242,9 +245,13 @@ async function open(s, jumpIdx) {
   $('#exp').onclick = function () {
     var a = document.createElement('a');
     a.href = 'api/export?project=' + encodeURIComponent(data.project) +
-      '&id=' + encodeURIComponent(data.id);
+      '&id=' + encodeURIComponent(data.id) + shareQ();
     a.download = ''; document.body.appendChild(a); a.click(); a.remove();
   };
+  if (SHARE) {
+    $('#fav').style.display = 'none'; $('#share').style.display = 'none';
+    $('#sub').innerHTML += '<span class="robadge">只读分享</span>';
+  }
   syncFavUI(data);
   renderChains(data);
   renderMain(data.messages);
@@ -300,6 +307,32 @@ async function setFav(s, fav, note) {
   if (JSON.stringify(favs[favKey(s)] || null) === old) return; // 无变化不重绘
   if (current && current.id === s.id) syncFavUI(s);
   render($('#q').value.trim());
+}
+
+// ---------- 只读分享 ----------
+$('#share').onclick = async function () {
+  if (!current) return;
+  var r = await fetch('api/share', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project: current.project, id: current.id, days: 7 })
+  });
+  var j = await r.json();
+  if (!j.token) return;
+  var link = location.origin + location.pathname + '?share=' + encodeURIComponent(j.token) +
+    '#s=' + encodeURIComponent(current.project) + '/' + encodeURIComponent(current.id);
+  var note = '只读链接（' + new Date(j.exp).toLocaleDateString('zh-CN') + ' 过期）：';
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(link).then(function () {
+      var b = $('#share'); b.textContent = '✓ 已复制';
+      setTimeout(function () { b.textContent = '分享'; }, 1500);
+    }, function () { window.prompt(note, link); });
+  } else window.prompt(note, link);
+};
+// 访客只读视图：无侧栏，仅渲染 token 对应的会话
+function showShareView() {
+  $('#login').style.display = 'none'; $('#side').style.display = 'none';
+  $('#main').style.display = 'flex';
+  navFromHash();
 }
 
 // ---------- 实时跟踪进行中的会话 ----------
@@ -429,7 +462,8 @@ async function switchChain(agentId, chipEl) {
   chipEl.classList.add('on');
   view.mode = agentId;
   var sc = await (await fetch('api/sidechain?project=' + encodeURIComponent(current.project) +
-    '&id=' + encodeURIComponent(current.id) + '&agent=' + encodeURIComponent(agentId))).json();
+    '&id=' + encodeURIComponent(current.id) + '&agent=' + encodeURIComponent(agentId) +
+    shareQ())).json();
   var conv = $('#conv'); conv.innerHTML = '';
   var wrap = document.createElement('div'); wrap.className = 'wrap';
   var head = document.createElement('div'); head.className = 'divider';
@@ -742,5 +776,7 @@ $('#logout').onclick = async function () { await fetch('api/logout'); showLogin(
 initTheme();
 (async function () {
   var me = await (await fetch('api/me')).json();
-  if (me.authed) showApp(); else showLogin();
+  if (me.authed) showApp();
+  else if (SHARE) showShareView();
+  else showLogin();
 })();
