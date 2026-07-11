@@ -327,6 +327,78 @@ async function switchChain(agentId, chipEl) {
   if (view.terms.length) setupHits(); else hideHits();
 }
 
+// ---------- 工具调用友好渲染 ----------
+function shortPath(p) { return String(p || '').replace(/^\/(root|home\/[^/]+)\//, '~/'); }
+function clip(s, n) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+function bodyDiv(html) { return '<div class="body">' + html + '</div>'; }
+function diffBody(oldS, newS, terms) {
+  var h = '';
+  if (oldS) String(oldS).split('\n').forEach(function (l) {
+    h += '<span class="dl">- ' + hi(l, terms) + '</span>';
+  });
+  if (newS) String(newS).split('\n').forEach(function (l) {
+    h += '<span class="al">+ ' + hi(l, terms) + '</span>';
+  });
+  return '<div class="body diff">' + h + '</div>';
+}
+function toolView(name, inp, terms) {
+  var sum = '🔧 ' + esc(name);
+  var body = bodyDiv(hi(JSON.stringify(inp, null, 2) || '', terms));
+  if (name === 'Bash' && inp.command) {
+    sum = '🖥 ' + esc(clip(inp.command, 90));
+    body = bodyDiv('$ ' + hi(inp.command, terms) +
+      (inp.description ? '\n\n# ' + hi(inp.description, terms) : ''));
+  } else if (name === 'Read' && inp.file_path) {
+    sum = '📖 Read · ' + esc(shortPath(inp.file_path)) +
+      (inp.offset ? esc(' :' + inp.offset + (inp.limit ? '+' + inp.limit : '')) : '');
+  } else if (name === 'Write' && inp.file_path) {
+    sum = '📝 Write · ' + esc(shortPath(inp.file_path));
+    body = bodyDiv(hi(String(inp.content || '').slice(0, 20000), terms));
+  } else if (name === 'Edit' && inp.file_path) {
+    sum = '✏️ Edit · ' + esc(shortPath(inp.file_path)) + (inp.replace_all ? ' · 全部替换' : '');
+    body = diffBody(inp.old_string, inp.new_string, terms);
+  } else if (name === 'NotebookEdit' && inp.notebook_path) {
+    sum = '✏️ NotebookEdit · ' + esc(shortPath(inp.notebook_path));
+  } else if ((name === 'TodoWrite' || name === 'update_todos') && Array.isArray(inp.todos)) {
+    var done = inp.todos.filter(function (t) { return t.status === 'completed'; }).length;
+    sum = '📋 待办 ' + done + '/' + inp.todos.length;
+    body = bodyDiv(inp.todos.map(function (t) {
+      var ic = t.status === 'completed' ? '☑' : t.status === 'in_progress' ? '▶' : '☐';
+      return ic + ' ' + hi(t.content || t.subject || '', terms);
+    }).join('\n'));
+  } else if ((name === 'Task' || name === 'Agent') && (inp.prompt || inp.description)) {
+    sum = '🤖 ' + esc(name) + (inp.subagent_type ? ' · ' + esc(inp.subagent_type) : '') +
+      ' · ' + esc(clip(inp.description || '', 50));
+    body = bodyDiv(hi(inp.prompt || '', terms));
+  } else if (name === 'TaskCreate' && inp.subject) {
+    sum = '📋 建任务 · ' + esc(clip(inp.subject, 70));
+    body = bodyDiv(hi(inp.subject + (inp.description ? '\n\n' + inp.description : ''), terms));
+  } else if (name === 'TaskUpdate' && inp.taskId) {
+    sum = '📋 任务 #' + esc(String(inp.taskId)) +
+      (inp.status ? ' → ' + esc(inp.status) : ' 更新');
+  } else if ((name === 'Grep' || name === 'Glob') && inp.pattern) {
+    sum = '🔍 ' + esc(name) + ' · ' + esc(clip(inp.pattern, 60)) +
+      (inp.path ? ' <span class="dim">' + esc(shortPath(inp.path)) + '</span>' : '');
+  } else if ((name === 'WebFetch' || name === 'WebSearch') && (inp.url || inp.query)) {
+    sum = '🌐 ' + esc(name) + ' · ' + esc(clip(inp.url || inp.query, 70));
+  } else if (name === 'AskUserQuestion' && Array.isArray(inp.questions)) {
+    sum = '❓ 提问 · ' + esc(clip((inp.questions[0] || {}).question || '', 60));
+    body = bodyDiv(inp.questions.map(function (q) {
+      return hi(q.question || '', terms) + '\n' + (q.options || []).map(function (o) {
+        return '  ○ ' + hi(o.label || '', terms);
+      }).join('\n');
+    }).join('\n\n'));
+  } else if (name === 'Skill' && inp.skill) {
+    sum = '⚡ /' + esc(inp.skill) + (inp.args ? ' ' + esc(clip(inp.args, 50)) : '');
+  } else if (name === 'ExitPlanMode' || name === 'EnterPlanMode') {
+    sum = '🗺 ' + esc(name === 'EnterPlanMode' ? '进入规划模式' : '退出规划模式');
+  }
+  return { sum: sum, body: body };
+}
+
 // ---------- 消息 ----------
 function msgEl(m, terms, side) {
   if (m.blocks.length === 1 && m.blocks[0].kind === 'compact') {
@@ -346,9 +418,11 @@ function msgEl(m, terms, side) {
     else if (b.kind === 'thinking')
       inner += '<details class="think block"><summary>思考 · ' + b.text.length +
         ' 字</summary><div class="mdbody md">' + md(b.text, terms) + '</div></details>';
-    else if (b.kind === 'tool_use')
-      inner += '<details class="tool block"><summary>🔧 ' + esc(b.name) +
-        '</summary><div class="body">' + esc(JSON.stringify(b.input, null, 2) || '') + '</div></details>';
+    else if (b.kind === 'tool_use') {
+      var tv = toolView(b.name, b.input || {}, terms);
+      inner += '<details class="tool block"><summary>' + tv.sum + '</summary>' +
+        tv.body + '</details>';
+    }
     else if (b.kind === 'tool_result')
       inner += '<details class="tool block' + (b.isError ? ' terr' : '') +
         '"><summary>' + (b.isError ? '⚠ 工具报错' : '↩ 工具结果') + ' · ' + (b.text || '').length +

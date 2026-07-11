@@ -649,6 +649,14 @@ details .body{padding:2px 12px 10px;white-space:pre-wrap;word-break:break-word;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--ink);
   max-height:340px;overflow:auto}
 .terr summary{color:#d64545}
+details.tool summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dim{opacity:.65}
+/* Edit 工具的红绿 diff */
+.body.diff{padding:8px 12px}
+.diff .dl,.diff .al{display:block;white-space:pre-wrap;word-break:break-word;
+  border-radius:3px;padding:0 4px;margin:1px 0}
+.diff .dl{background:rgba(214,69,69,.13)}
+.diff .al{background:rgba(82,196,26,.13)}
 /* Markdown 正文 */
 .md{white-space:normal;line-height:1.62}
 .md>*:first-child{margin-top:0}.md>*:last-child{margin-bottom:0}
