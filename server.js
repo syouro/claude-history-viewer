@@ -488,6 +488,10 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/session') {
       const s = loadSession(url.searchParams.get('project'), url.searchParams.get('id'));
       if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
+      // meta=1：只回元信息（供实时轮询比对），不带消息体
+      if (url.searchParams.get('meta') === '1') {
+        sendJSON(res, { ...summary(s), total: s.msgCount }); return;
+      }
       // 分页：limit 条、结束于 before（不含）；limit=0 表示全量
       let limit = url.searchParams.has('limit') ? +url.searchParams.get('limit') : 80;
       if (!Number.isFinite(limit) || limit < 0) limit = 80;
@@ -615,6 +619,9 @@ button,select,input{font-family:inherit}
 .item .t{font-size:13px;font-weight:560;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item .r{font-size:10.5px;color:var(--muted);margin-top:3px;display:flex;gap:8px}
 .badge{background:var(--accent);color:#fff;border-radius:8px;padding:0 6px;font-size:10px;font-weight:600}
+.liveb{color:#3fb950;font-weight:600;white-space:nowrap}
+@keyframes lpulse{0%,100%{opacity:1}50%{opacity:.3}}
+.liveb::before{content:"● ";animation:lpulse 1.6s ease-in-out infinite}
 .snip{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.4;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}

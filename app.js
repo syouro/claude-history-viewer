@@ -170,11 +170,13 @@ function extras(s) {
   if (s.hasSummary) out += '<span>📦 续接</span>';
   return out;
 }
+function isLive(s) { return Date.now() - s.mtime < 120e3; }
 function itemEl(s, filter) {
   var el = document.createElement('div');
   el.className = 'item' + (current && current.id === s.id ? ' on' : '');
   el.innerHTML = '<div class="t">' + (filter ? hi(s.title, [filter]) : esc(s.title)) + '</div>' +
-    '<div class="r"><span>' + rel(s.lastTs) + '</span><span>' + s.msgCount + ' 条</span>' +
+    '<div class="r">' + (isLive(s) ? '<span class="liveb">进行中</span>' : '') +
+    '<span>' + rel(s.lastTs) + '</span><span>' + s.msgCount + ' 条</span>' +
     extras(s) + '</div>';
   el.onclick = function () { open(s); };
   return el;
@@ -219,7 +221,7 @@ async function open(s) {
   view = { offset: data.offset, total: data.total, terms: full ? lastTerms : [],
     mode: 'main', loading: false, wrap: null, older: null };
   $('#top').style.display = 'flex'; $('#ttl').textContent = data.title;
-  var bits = [projName(data.project), data.msgCount + ' 条消息',
+  var bits = [projName(data.project), '<span id="mcount">' + data.msgCount + ' 条消息</span>',
     data.agentName ? ('⚙ ' + esc(data.agentName)) : '',
     data.gitBranch ? ('⎇ ' + data.gitBranch) : '',
     data.cwd ? ('<span class="mono">' + esc(data.cwd) + '</span>') : '',
@@ -233,8 +235,54 @@ async function open(s) {
   };
   renderChains(data);
   renderMain(data.messages);
+  scheduleLive();
   if (searchMode) doSearch($('#q').value.trim()); else render($('#q').value.trim());
 }
+
+// ---------- 实时跟踪进行中的会话 ----------
+var liveTimer = null;
+function scheduleLive() {
+  clearTimeout(liveTimer);
+  if (!current) return;
+  // 活跃会话（2 分钟内有写入）3s 一查，闲置的 15s 一查
+  liveTimer = setTimeout(pollLive, isLive(current) ? 3000 : 15000);
+}
+async function pollLive() {
+  if (!current) return;
+  if (document.hidden) { scheduleLive(); return; }
+  try {
+    var meta = await apiSession(current, '&meta=1');
+    if (!current || meta.id !== current.id) return; // 期间切换了会话
+    current.mtime = meta.mtime;
+    var mc = $('#mcount'); if (mc) mc.textContent = meta.total + ' 条消息';
+    if (view.mode === 'main' && meta.total > view.total) {
+      var delta = await apiSession(current,
+        '&limit=' + (meta.total - view.total) + '&before=' + meta.total);
+      if (!current || delta.id !== current.id || view.mode !== 'main') return;
+      var conv = $('#conv');
+      var follow = conv.scrollHeight - conv.scrollTop - conv.clientHeight < 150;
+      delta.messages.forEach(function (m) {
+        if (!m.isMeta) view.wrap.appendChild(msgEl(m, view.terms));
+      });
+      view.total = meta.total;
+      if (follow) conv.scrollTop = conv.scrollHeight; // 在底部时自动跟随
+    } else if (meta.total < view.total) {
+      open(current); return; // 文件被重写（罕见），整体重开
+    }
+  } catch (e) { /* 网络抖动，下轮再试 */ }
+  scheduleLive();
+}
+// 侧栏列表每分钟静默刷新（保持滚动位置；搜索模式不打扰）
+setInterval(function () {
+  if (document.hidden || searchMode) return;
+  fetch('api/sessions').then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      if (!d) return;
+      var list = $('#list'), st = list.scrollTop;
+      sessions = d; fillProjects(); render($('#q').value.trim());
+      list.scrollTop = st;
+    });
+}, 60000);
 function renderMain(msgs) {
   var conv = $('#conv'); conv.innerHTML = '';
   var wrap = document.createElement('div'); wrap.className = 'wrap';
