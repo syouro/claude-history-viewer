@@ -1,6 +1,7 @@
 # 机器私有，勿入库
 secret.json
 config.json
+favorites.json
 nginx.conf.bak
 *.log
 node_modules/

@@ -297,6 +297,14 @@ function sessionFile(project, id) {
   return null;
 }
 
+// ---------- 收藏（persist 到 favorites.json）----------
+const FAVS_PATH = path.join(__dirname, 'favorites.json');
+let FAVS = {};
+try { FAVS = JSON.parse(fs.readFileSync(FAVS_PATH, 'utf8')); } catch { /* 首次 */ }
+function saveFavs() {
+  try { fs.writeFileSync(FAVS_PATH, JSON.stringify(FAVS, null, 2)); } catch { /* */ }
+}
+
 // ---------- 缓存 ----------
 // 全量会话缓存带 LRU 上限（消息占内存）；摘要缓存无消息、常驻，列表接口只碰它。
 const cache = new Map();
@@ -539,6 +547,19 @@ const server = http.createServer(async (req, res) => {
       if (!sc) { sendJSON(res, { error: 'not found' }, 404); return; }
       sendJSON(res, sc); return;
     }
+    if (p === '/api/favs') { sendJSON(res, FAVS); return; }
+    if (p === '/api/fav' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
+        sendJSON(res, { error: 'bad request' }, 400); return;
+      }
+      const key = body.project + '/' + body.id;
+      if (body.fav) FAVS[key] = { note: String(body.note || '').slice(0, 500), ts: Date.now() };
+      else delete FAVS[key];
+      saveFavs();
+      sendJSON(res, { ok: true, favs: FAVS }); return;
+    }
     if (p === '/api/stats') {
       const days = {}, byProject = {}, byModel = {};
       const totals = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, sessions: 0, msgTotal: 0 };
@@ -679,9 +700,16 @@ mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}
   display:none;align-items:flex-start;justify-content:space-between;gap:12px}
 #top h2{margin:0;font-size:16px}
 #top .sub{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:14px;flex-wrap:wrap}
-#exp{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
+.tbtns{display:flex;gap:8px;align-items:flex-start}
+#exp,#fav{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
   padding:7px 12px;font-size:12.5px;cursor:pointer;white-space:nowrap}
-#exp:hover{border-color:var(--accent)}
+#exp:hover,#fav:hover{border-color:var(--accent)}
+#fav.on{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+#favnote{margin-top:8px;width:min(420px,100%);padding:6px 10px;border:1px solid var(--line);
+  border-radius:8px;background:var(--field);color:var(--ink);font-size:12px;outline:none}
+#favnote:focus{border-color:var(--accent)}
+.fnote{font-size:11.5px;color:var(--accent);margin-top:3px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 #conv{flex:1;overflow-y:auto;padding:22px 22px 80px}
 .wrap{max-width:860px;margin:0 auto}
 .msg{margin-bottom:16px;display:flex;gap:12px;content-visibility:auto;contain-intrinsic-size:auto 120px}
@@ -820,8 +848,10 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 </aside>
 
 <main id="main" style="display:none;position:relative">
-  <div id="top"><div><h2 id="ttl"></h2><div class="sub" id="sub"></div></div>
-    <button id="exp">导出 MD</button></div>
+  <div id="top"><div style="min-width:0;flex:1"><h2 id="ttl"></h2><div class="sub" id="sub"></div>
+      <input id="favnote" placeholder="收藏备注，回车保存" style="display:none"></div>
+    <div class="tbtns"><button id="fav" title="收藏">☆</button>
+      <button id="exp">导出 MD</button></div></div>
   <div id="chains"></div>
   <div id="hitbar"><span id="hitn"></span>
     <button id="hitPrev" title="上一处">↑</button><button id="hitNext" title="下一处">↓</button></div>

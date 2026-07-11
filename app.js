@@ -1,6 +1,7 @@
 'use strict';
 var $ = function (s) { return document.querySelector(s); };
-var sessions = [], current = null, searchMode = false, lastTerms = [];
+var sessions = [], current = null, searchMode = false, lastTerms = [], favs = {};
+function favKey(s) { return s.project + '/' + s.id; }
 var PAGE = 80; // 每次加载的消息条数
 
 function esc(s) {
@@ -147,6 +148,13 @@ function render(filter) {
   });
   $('#count').textContent = items.length + ' 段对话';
   $('#mode').textContent = filter ? '标题过滤' : '';
+  // 收藏组置顶
+  var favItems = items.filter(function (s) { return favs[favKey(s)]; });
+  if (favItems.length) {
+    var fg = document.createElement('div'); fg.className = 'grp'; fg.textContent = '★ 收藏';
+    list.appendChild(fg);
+    favItems.forEach(function (s) { list.appendChild(itemEl(s, filter)); });
+  }
   var byProj = {};
   items.forEach(function (s) { (byProj[s.project] = byProj[s.project] || []).push(s); });
   var projs = Object.keys(byProj).sort(function (a, b) {
@@ -174,7 +182,10 @@ function isLive(s) { return Date.now() - s.mtime < 120e3; }
 function itemEl(s, filter) {
   var el = document.createElement('div');
   el.className = 'item' + (current && current.id === s.id ? ' on' : '');
-  el.innerHTML = '<div class="t">' + (filter ? hi(s.title, [filter]) : esc(s.title)) + '</div>' +
+  var fv = favs[favKey(s)];
+  el.innerHTML = '<div class="t">' + (fv ? '★ ' : '') +
+    (filter ? hi(s.title, [filter]) : esc(s.title)) + '</div>' +
+    (fv && fv.note ? '<div class="fnote">' + esc(fv.note) + '</div>' : '') +
     '<div class="r">' + (isLive(s) ? '<span class="liveb">进行中</span>' : '') +
     '<span>' + rel(s.lastTs) + '</span><span>' + s.msgCount + ' 条</span>' +
     extras(s) + '</div>';
@@ -233,10 +244,40 @@ async function open(s) {
       '&id=' + encodeURIComponent(data.id);
     a.download = ''; document.body.appendChild(a); a.click(); a.remove();
   };
+  syncFavUI(data);
   renderChains(data);
   renderMain(data.messages);
   scheduleLive();
   if (searchMode) doSearch($('#q').value.trim()); else render($('#q').value.trim());
+}
+
+// ---------- 收藏 ----------
+async function loadFavs() {
+  try { favs = await (await fetch('api/favs')).json(); } catch (e) { favs = {}; }
+}
+function syncFavUI(s) {
+  var fv = favs[favKey(s)];
+  $('#fav').textContent = fv ? '★ 已收藏' : '☆ 收藏';
+  $('#fav').className = fv ? 'on' : '';
+  var inp = $('#favnote');
+  inp.style.display = fv ? 'block' : 'none';
+  inp.value = fv ? (fv.note || '') : '';
+  $('#fav').onclick = function () { setFav(s, !fv, fv ? fv.note : ''); };
+  inp.onkeydown = function (e) { if (e.key === 'Enter') { setFav(s, true, inp.value); inp.blur(); } };
+  inp.onblur = function () { if (favs[favKey(s)]) setFav(s, true, inp.value); };
+}
+async function setFav(s, fav, note) {
+  var old = JSON.stringify(favs[favKey(s)] || null);
+  var r = await fetch('api/fav', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project: s.project, id: s.id, fav: fav, note: note || '' })
+  });
+  var j = await r.json();
+  if (!j.ok) return;
+  favs = j.favs;
+  if (JSON.stringify(favs[favKey(s)] || null) === old) return; // 无变化不重绘
+  if (current && current.id === s.id) syncFavUI(s);
+  render($('#q').value.trim());
 }
 
 // ---------- 实时跟踪进行中的会话 ----------
@@ -616,7 +657,8 @@ function showLogin() {
 }
 function showApp() {
   $('#login').style.display = 'none'; $('#side').style.display = 'flex';
-  $('#main').style.display = 'flex'; loadList();
+  $('#main').style.display = 'flex';
+  loadFavs().then(loadList);
 }
 async function doLogin() {
   var pw = $('#pw').value; $('#loginErr').textContent = '';
