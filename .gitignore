@@ -1,0 +1,6 @@
+# 机器私有，勿入库
+secret.json
+config.json
+nginx.conf.bak
+*.log
+node_modules/

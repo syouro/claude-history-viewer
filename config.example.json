@@ -1,0 +1,10 @@
+{
+  "roots": [
+    "~/.claude/projects"
+  ],
+  "exclude": [],
+  "port": 48213,
+  "host": "127.0.0.1",
+  "cookiePath": "/",
+  "secureCookie": true
+}
