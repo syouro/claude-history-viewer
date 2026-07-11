@@ -1,10 +1,12 @@
 # Claude 对话历史查看器
 
+[English](README.en.md) | 中文
+
 零依赖 Node 单文件服务，浏览 `~/.claude/projects/` 下的对话历史。带登录鉴权，可经反代公网访问。
 
 ## 访问
 
-- 公网：<https://example.com:8443/history/>（OpenResty 反代 → 本机 48213）
+- 公网：`https://你的域名/history/`（反代 → 本机 48213）
 - 本机：`http://127.0.0.1:48213`
 
 登录密码存在 `secret.json`（首次启动随机生成）。查看 / 修改：
@@ -96,7 +98,7 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 - 参数白名单校验，防路径穿越
 - `secret.json`、`nginx.conf.bak` 勿入库
 
-## 反代（已写入 OpenResty，`example.com` server 块内）
+## 反代（nginx / OpenResty 示例）
 
 ```nginx
 location = /history { return 301 /history/; }
