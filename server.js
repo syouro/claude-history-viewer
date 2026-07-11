@@ -172,6 +172,25 @@ function parseSession(project, id, filePath) {
   const summaries = [];           // 压缩续接产生的历史摘要
   let title = '', firstPrompt = '', cwd = '', gitBranch = '', agentName = '';
   let firstTs = null, lastTs = null;
+  // token 用量统计（含子代理）
+  const usage = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0 };
+  const usageByDay = {}, usageByModel = {};
+  const addU = (t, u) => {
+    t.in += u.input_tokens || 0; t.out += u.output_tokens || 0;
+    t.cw += u.cache_creation_input_tokens || 0; t.cr += u.cache_read_input_tokens || 0;
+    t.msgs++;
+  };
+  const addUsage = (msg, ts) => {
+    const u = msg.usage;
+    if (!u) return;
+    addU(usage, u);
+    const day = ts ? String(ts).slice(0, 10) : '';
+    if (day) addU(usageByDay[day] = usageByDay[day] ||
+      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0 }, u);
+    const model = msg.model && msg.model !== '<synthetic>' ? msg.model : '(unknown)';
+    addU(usageByModel[model] = usageByModel[model] ||
+      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0 }, u);
+  };
   for (const line of raw.split('\n')) {
     const s = line.trim();
     if (!s) continue;
@@ -197,6 +216,7 @@ function parseSession(project, id, filePath) {
     if (ts) { if (!firstTs) firstTs = ts; lastTs = ts; }
     if (o.cwd) cwd = o.cwd;
     if (o.gitBranch) gitBranch = o.gitBranch;
+    if (role === 'assistant') addUsage(msg, ts);
     const m = { role, ts, isMeta, blocks };
     if (o.isCompactSummary) m.compact = true;
     if (o.isSidechain) {
@@ -236,6 +256,7 @@ function parseSession(project, id, filePath) {
         const ts = o.timestamp || null;
         if (ts) { if (!sc.firstTs) sc.firstTs = ts; sc.lastTs = ts; }
         if (!sc.firstPrompt && role === 'user') sc.firstPrompt = plainText(blocks).slice(0, 160);
+        if (role === 'assistant') addUsage(msg, ts);
         sc.messages.push({ role, ts, isMeta: !!o.isMeta, blocks });
       }
       if (sc.messages.length) sidechains.set(sc.agentId, sc);
@@ -247,6 +268,7 @@ function parseSession(project, id, filePath) {
     project, id, title: title || firstPrompt || '(无标题)', firstPrompt,
     cwd, gitBranch, agentName, mtime: stat.mtimeMs, firstTs, lastTs,
     msgCount: messages.length, summaries,
+    usage, usageByDay, usageByModel,
     sidechains: chains, messages,
   };
 }
@@ -341,6 +363,7 @@ function summary(s) {
     cwd: s.cwd, gitBranch: s.gitBranch, agentName: s.agentName, mtime: s.mtime,
     firstTs: s.firstTs, lastTs: s.lastTs, msgCount: s.msgCount,
     sidechainCount: s.sidechains.length, hasSummary: s.summaries.length > 0,
+    usage: s.usage, usageByDay: s.usageByDay, usageByModel: s.usageByModel,
   };
 }
 function search(q, includeThinking) {
@@ -516,6 +539,28 @@ const server = http.createServer(async (req, res) => {
       if (!sc) { sendJSON(res, { error: 'not found' }, 404); return; }
       sendJSON(res, sc); return;
     }
+    if (p === '/api/stats') {
+      const days = {}, byProject = {}, byModel = {};
+      const totals = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, sessions: 0, msgTotal: 0 };
+      const zero = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0 });
+      const add = (t, u) => {
+        t.in += u.in; t.out += u.out; t.cw += u.cw; t.cr += u.cr; t.msgs += u.msgs;
+      };
+      for (const s of listAll()) {
+        totals.sessions++; totals.msgTotal += s.msgCount;
+        if (s.usage) add(totals, s.usage);
+        for (const [day, u] of Object.entries(s.usageByDay || {}))
+          add(days[day] = days[day] || zero(), u);
+        if (s.usage && s.usage.msgs) {
+          const pj = byProject[s.project] = byProject[s.project] ||
+            { ...zero(), sessions: 0 };
+          add(pj, s.usage); pj.sessions++;
+        }
+        for (const [m, u] of Object.entries(s.usageByModel || {}))
+          add(byModel[m] = byModel[m] || zero(), u);
+      }
+      sendJSON(res, { totals, days, byProject, byModel }); return;
+    }
     if (p === '/api/search') {
       const inc = url.searchParams.get('thinking') === '1';
       sendJSON(res, search(url.searchParams.get('q') || '', inc)); return;
@@ -562,16 +607,19 @@ const HTML = /* html */ `<!doctype html><html lang="zh"><head>
   --bg:#f6f7f9;--panel:#fff;--ink:#1c2024;--muted:#7a828c;--line:#e6e8eb;
   --accent:#d97757;--accent-soft:#f7ede8;--user:#eef2ff;--assist:#fff;
   --think:#f3f4f6;--tool:#f0f4f2;--mark:#ffe58a;--field:#f6f7f9;
+  --chart:#d97757;
 }
 @media (prefers-color-scheme:dark){:root:not([data-theme]){
   --bg:#16181c;--panel:#1e2126;--ink:#e6e8eb;--muted:#8b929c;--line:#2b2f36;
   --accent:#e08a6b;--accent-soft:#3a2a23;--user:#232a3d;--assist:#1e2126;
   --think:#23262c;--tool:#1f2723;--mark:#5c4d1a;--field:#16181c;
+  --chart:#d3714f;
 }}
 :root[data-theme=dark]{
   --bg:#16181c;--panel:#1e2126;--ink:#e6e8eb;--muted:#8b929c;--line:#2b2f36;
   --accent:#e08a6b;--accent-soft:#3a2a23;--user:#232a3d;--assist:#1e2126;
   --think:#23262c;--tool:#1f2723;--mark:#5c4d1a;--field:#16181c;
+  --chart:#d3714f;
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
@@ -706,6 +754,33 @@ mark.cur{outline:2px solid var(--accent);border-radius:3px}
 /* 压缩摘要 / 边界 */
 .divider{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11.5px;margin:18px 0}
 .divider::before,.divider::after{content:"";flex:1;border-top:1px dashed var(--line)}
+/* 用量统计面板 */
+.stats h3{font-size:13px;margin:22px 0 10px;color:var(--muted);font-weight:600;
+  text-transform:uppercase;letter-spacing:.05em}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.tile .v{font-size:20px;font-weight:660;letter-spacing:-.01em}
+.tile .k{font-size:11px;color:var(--muted);margin-top:2px}
+.chart{position:relative;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:16px 14px 8px}
+.cbars{display:flex;align-items:flex-end;gap:2px;height:150px;
+  border-bottom:1px solid var(--line)}
+.cbar{flex:1;min-width:3px;position:relative;display:flex;align-items:flex-end;height:100%}
+.cbar i{display:block;width:100%;background:var(--chart);border-radius:3px 3px 0 0;min-height:0}
+.cbar:hover i{filter:brightness(1.15)}
+.cxl{display:flex;gap:2px;margin-top:4px}
+.cxl span{flex:1;font-size:9.5px;color:var(--muted);text-align:center;overflow:visible;white-space:nowrap}
+.cpeak{position:absolute;font-size:10px;color:var(--muted);transform:translateX(-50%);white-space:nowrap}
+.ctip{position:absolute;z-index:6;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;font-size:11.5px;box-shadow:0 6px 20px rgba(0,0,0,.15);
+  pointer-events:none;display:none;white-space:nowrap;line-height:1.6}
+.stbl{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;overflow:hidden;font-size:12.5px}
+.stbl th,.stbl td{padding:7px 12px;text-align:right;border-top:1px solid var(--line)}
+.stbl th{color:var(--muted);font-weight:600;font-size:11px;border-top:0;background:var(--field)}
+.stbl th:first-child,.stbl td:first-child{text-align:left}
+.stbl td{font-variant-numeric:tabular-nums}
+.tblwrap{overflow-x:auto;border-radius:12px}
 details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 .msg.agent .who{color:#7c6bd6}
 </style></head><body>
@@ -725,6 +800,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     <div class="hrow">
       <h1><span class="dot"></span>Claude 对话历史</h1>
       <div class="icons">
+        <button class="iconbtn" id="statsBtn" title="用量统计">📊</button>
         <button class="iconbtn" id="theme" title="切换深浅色">◐</button>
         <button class="iconbtn" id="logout" title="退出登录">⏻</button>
       </div>

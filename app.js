@@ -510,6 +510,90 @@ function gotoHit(i) {
 $('#hitPrev').onclick = function () { gotoHit(hitIdx - 1); };
 $('#hitNext').onclick = function () { gotoHit(hitIdx + 1); };
 
+// ---------- 用量统计面板 ----------
+function fmtTok(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function tile(v, k) {
+  return '<div class="tile"><div class="v">' + v + '</div><div class="k">' + k + '</div></div>';
+}
+function usageRow(name, u, extra) {
+  return '<tr><td>' + esc(name) + '</td>' + (extra || '') +
+    '<td>' + u.msgs + '</td><td>' + fmtTok(u.out) + '</td><td>' + fmtTok(u.in) +
+    '</td><td>' + fmtTok(u.cw) + '</td><td>' + fmtTok(u.cr) + '</td></tr>';
+}
+var USAGE_TH = '<th>消息</th><th>输出</th><th>输入</th><th>缓存写</th><th>缓存读</th>';
+async function openStats() {
+  var st = await (await fetch('api/stats')).json();
+  current = null; view.mode = 'stats'; clearTimeout(liveTimer);
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
+  // 近 30 天逐日序列（缺的日期补零）
+  var days = [], today = new Date();
+  for (var i = 29; i >= 0; i--) {
+    var d = new Date(today.getTime() - i * 86400e3);
+    days.push(d.toISOString().slice(0, 10));
+  }
+  var series = days.map(function (day) { return { day: day, u: st.days[day] || null }; });
+  var max = Math.max.apply(0, series.map(function (s) { return s.u ? s.u.out : 0; })) || 1;
+  var bars = '', labels = '', peak = '';
+  series.forEach(function (s, i) {
+    var out = s.u ? s.u.out : 0;
+    var h = Math.round(out / max * 100);
+    bars += '<div class="cbar" data-i="' + i + '"><i style="height:' + h + '%"></i></div>';
+    labels += '<span>' + (i % 5 === 0 ? s.day.slice(5) : '') + '</span>';
+    if (out === max && out > 0 && !peak)
+      peak = '<div class="cpeak" style="left:' + ((i + 0.5) / 30 * 100) + '%;top:2px">' +
+        fmtTok(out) + '</div>';
+  });
+  var t = st.totals;
+  var projRows = Object.keys(st.byProject).sort(function (a, b) {
+    return st.byProject[b].out - st.byProject[a].out;
+  }).map(function (pj) {
+    var u = st.byProject[pj];
+    return usageRow(projName(pj), u, '<td>' + u.sessions + '</td>');
+  }).join('');
+  var modelRows = Object.keys(st.byModel).sort(function (a, b) {
+    return st.byModel[b].out - st.byModel[a].out;
+  }).map(function (m) { return usageRow(m, st.byModel[m]); }).join('');
+  $('#conv').innerHTML = '<div class="wrap stats">' +
+    '<div class="tiles">' +
+    tile(t.sessions, '会话') + tile(t.msgTotal, '消息') +
+    tile(fmtTok(t.out), '输出 token') + tile(fmtTok(t.in), '输入 token') +
+    tile(fmtTok(t.cw), '缓存写入') + tile(fmtTok(t.cr), '缓存读取') +
+    '</div>' +
+    '<h3>近 30 天 · 每日输出 token</h3>' +
+    '<div class="chart">' + peak + '<div class="cbars">' + bars + '</div>' +
+    '<div class="cxl">' + labels + '</div><div class="ctip" id="ctip"></div></div>' +
+    '<h3>按项目</h3><div class="tblwrap"><table class="stbl">' +
+    '<tr><th>项目</th><th>会话</th>' + USAGE_TH + '</tr>' + projRows + '</table></div>' +
+    '<h3>按模型</h3><div class="tblwrap"><table class="stbl">' +
+    '<tr><th>模型</th>' + USAGE_TH + '</tr>' + modelRows + '</table></div>' +
+    '</div>';
+  $('#conv').scrollTop = 0;
+  // 悬浮提示：逐条柱子显示当日完整拆解
+  var tip = $('#ctip');
+  document.querySelectorAll('.cbar').forEach(function (bar) {
+    bar.addEventListener('mouseenter', function () {
+      var s = series[+bar.dataset.i];
+      var u = s.u || { out: 0, in: 0, cw: 0, cr: 0, msgs: 0 };
+      tip.innerHTML = '<b>' + s.day + '</b><br>输出 ' + fmtTok(u.out) +
+        ' · 输入 ' + fmtTok(u.in) + '<br>缓存写 ' + fmtTok(u.cw) +
+        ' · 读 ' + fmtTok(u.cr) + '<br>' + u.msgs + ' 条回复';
+      tip.style.display = 'block';
+      var r = bar.getBoundingClientRect(), c = bar.closest('.chart').getBoundingClientRect();
+      var x = r.left - c.left + r.width / 2;
+      tip.style.left = Math.min(Math.max(x - 60, 4), c.width - 150) + 'px';
+      tip.style.top = '20px';
+    });
+    bar.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+  });
+  render($('#q').value.trim());
+}
+
 // ---------- 事件 ----------
 var timer = null;
 function onQuery() {
@@ -560,6 +644,7 @@ $('#theme').onclick = function () {
   else document.documentElement.removeAttribute('data-theme');
   localStorage.setItem('chv-theme', next);
 };
+$('#statsBtn').onclick = openStats;
 $('#loginBtn').onclick = doLogin;
 $('#pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
 $('#logout').onclick = async function () { await fetch('api/logout'); showLogin(); };
