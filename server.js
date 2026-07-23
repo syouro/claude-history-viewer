@@ -165,6 +165,39 @@ function plainText(blocks) {
   return blocks.map((b) => b.text || (b.kind === 'tool_use' ? b.name : ''))
     .filter(Boolean).join(' ');
 }
+// ---------- 按模型估算美元花费（每百万 token 报价，来自 Anthropic 官方定价）----------
+// 缓存写入按 5 分钟 TTL（输入价 ×1.25）估算，缓存读取按 ×0.1 估算；
+// 会话记录里不区分 TTL，这是行业常见默认档位，非精确账单。
+const PRICING = {
+  'claude-fable-5': { in: 10, out: 50 },
+  'claude-mythos-5': { in: 10, out: 50 },
+  'claude-opus-4-8': { in: 5, out: 25 },
+  'claude-opus-4-7': { in: 5, out: 25 },
+  'claude-opus-4-6': { in: 5, out: 25 },
+  'claude-opus-4-5': { in: 5, out: 25 },
+  'claude-opus-4-1': { in: 15, out: 75 },
+  'claude-opus-4-0': { in: 15, out: 75 },
+  'claude-sonnet-5': { in: 3, out: 15 },
+  'claude-sonnet-4-6': { in: 3, out: 15 },
+  'claude-sonnet-4-5': { in: 3, out: 15 },
+  'claude-sonnet-4-0': { in: 3, out: 15 },
+  'claude-haiku-4-5': { in: 1, out: 5 },
+};
+function priceFor(model) {
+  if (!model) return null;
+  if (PRICING[model]) return PRICING[model];
+  const noDate = model.match(/^(.*)-\d{8}$/); // 去掉形如 -20250929 的日期后缀再查一次
+  if (noDate && PRICING[noDate[1]]) return PRICING[noDate[1]];
+  return null;
+}
+function costOf(u, model) {
+  const p = priceFor(model);
+  if (!p) return null;
+  const inRate = p.in / 1e6, outRate = p.out / 1e6;
+  return (u.input_tokens || 0) * inRate + (u.output_tokens || 0) * outRate +
+    (u.cache_creation_input_tokens || 0) * inRate * 1.25 +
+    (u.cache_read_input_tokens || 0) * inRate * 0.1;
+}
 function parseSession(project, id, filePath) {
   const stat = fs.statSync(filePath);
   const raw = fs.readFileSync(filePath, 'utf8');
@@ -174,23 +207,25 @@ function parseSession(project, id, filePath) {
   let title = '', firstPrompt = '', cwd = '', gitBranch = '', agentName = '';
   let firstTs = null, lastTs = null;
   // token 用量统计（含子代理）
-  const usage = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0 };
+  const usage = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 };
   const usageByDay = {}, usageByModel = {};
-  const addU = (t, u) => {
+  const addU = (t, u, model) => {
     t.in += u.input_tokens || 0; t.out += u.output_tokens || 0;
     t.cw += u.cache_creation_input_tokens || 0; t.cr += u.cache_read_input_tokens || 0;
     t.msgs++;
+    const c = costOf(u, model);
+    if (c != null) t.cost = (t.cost || 0) + c;
   };
   const addUsage = (msg, ts) => {
     const u = msg.usage;
     if (!u) return;
-    addU(usage, u);
+    const model = msg.model && msg.model !== '<synthetic>' ? msg.model : '(unknown)';
+    addU(usage, u, model);
     const day = ts ? String(ts).slice(0, 10) : '';
     if (day) addU(usageByDay[day] = usageByDay[day] ||
-      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0 }, u);
-    const model = msg.model && msg.model !== '<synthetic>' ? msg.model : '(unknown)';
+      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 }, u, model);
     addU(usageByModel[model] = usageByModel[model] ||
-      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0 }, u);
+      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 }, u, model);
   };
   for (const line of raw.split('\n')) {
     const s = line.trim();
@@ -599,10 +634,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/stats') {
       const days = {}, byProject = {}, byModel = {};
-      const totals = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, sessions: 0, msgTotal: 0 };
-      const zero = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0 });
+      const totals = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, sessions: 0, msgTotal: 0, cost: 0 };
+      const zero = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 });
       const add = (t, u) => {
         t.in += u.in; t.out += u.out; t.cw += u.cw; t.cr += u.cr; t.msgs += u.msgs;
+        t.cost += u.cost || 0;
       };
       for (const s of listAll()) {
         totals.sessions++; totals.msgTotal += s.msgCount;

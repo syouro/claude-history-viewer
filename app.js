@@ -237,6 +237,7 @@ async function open(s, jumpIdx) {
     mode: 'main', loading: false, wrap: null, older: null };
   $('#top').style.display = 'flex'; $('#ttl').textContent = data.title;
   var bits = [projName(data.project), '<span id="mcount">' + data.msgCount + ' 条消息</span>',
+    data.usage && data.usage.cost ? ('≈ ' + fmtUSD(data.usage.cost)) : '',
     data.agentName ? ('⚙ ' + esc(data.agentName)) : '',
     data.gitBranch ? ('⎇ ' + data.gitBranch) : '',
     data.cwd ? ('<span class="mono">' + esc(data.cwd) + '</span>') : '',
@@ -645,12 +646,17 @@ function fmtTok(n) {
 function tile(v, k) {
   return '<div class="tile"><div class="v">' + v + '</div><div class="k">' + k + '</div></div>';
 }
+function fmtUSD(n) {
+  n = n || 0;
+  return '$' + (n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toFixed(3));
+}
 function usageRow(name, u, extra) {
   return '<tr><td>' + esc(name) + '</td>' + (extra || '') +
     '<td>' + u.msgs + '</td><td>' + fmtTok(u.out) + '</td><td>' + fmtTok(u.in) +
-    '</td><td>' + fmtTok(u.cw) + '</td><td>' + fmtTok(u.cr) + '</td></tr>';
+    '</td><td>' + fmtTok(u.cw) + '</td><td>' + fmtTok(u.cr) +
+    '</td><td>' + fmtUSD(u.cost) + '</td></tr>';
 }
-var USAGE_TH = '<th>消息</th><th>输出</th><th>输入</th><th>缓存写</th><th>缓存读</th>';
+var USAGE_TH = '<th>消息</th><th>输出</th><th>输入</th><th>缓存写</th><th>缓存读</th><th>花费（估算）</th>';
 async function openStats() {
   var st = await (await fetch('api/stats')).json();
   current = null; view.mode = 'stats'; clearTimeout(liveTimer);
@@ -688,6 +694,7 @@ async function openStats() {
     tile(t.sessions, '会话') + tile(t.msgTotal, '消息') +
     tile(fmtTok(t.out), '输出 token') + tile(fmtTok(t.in), '输入 token') +
     tile(fmtTok(t.cw), '缓存写入') + tile(fmtTok(t.cr), '缓存读取') +
+    tile(fmtUSD(t.cost), '花费（估算）') +
     '</div>' +
     '<h3>近 30 天 · 每日输出 token</h3>' +
     '<div class="chart">' + peak + '<div class="cbars">' + bars + '</div>' +
@@ -703,10 +710,10 @@ async function openStats() {
   document.querySelectorAll('.cbar').forEach(function (bar) {
     bar.addEventListener('mouseenter', function () {
       var s = series[+bar.dataset.i];
-      var u = s.u || { out: 0, in: 0, cw: 0, cr: 0, msgs: 0 };
+      var u = s.u || { out: 0, in: 0, cw: 0, cr: 0, msgs: 0, cost: 0 };
       tip.innerHTML = '<b>' + s.day + '</b><br>输出 ' + fmtTok(u.out) +
         ' · 输入 ' + fmtTok(u.in) + '<br>缓存写 ' + fmtTok(u.cw) +
-        ' · 读 ' + fmtTok(u.cr) + '<br>' + u.msgs + ' 条回复';
+        ' · 读 ' + fmtTok(u.cr) + '<br>' + u.msgs + ' 条回复 · ' + fmtUSD(u.cost);
       tip.style.display = 'block';
       var r = bar.getBoundingClientRect(), c = bar.closest('.chart').getBoundingClientRect();
       var x = r.left - c.left + r.width / 2;
