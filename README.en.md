@@ -27,17 +27,17 @@ pm2 restart claude-history   # after code changes
 
 - Sessions grouped by project in the sidebar, newest first; a pinned **★ Favorites** group on top
 - **Search** — instant fuzzy title filter while typing; after a ~0.3 s pause, full-text search across all sessions (subagent sidechains included) with hit counts and highlighted snippets; opening a hit shows an “N / M ↑↓” navigator that jumps between matches and auto-expands collapsed blocks
-- **Filters** — project dropdown, time range (today / 7 / 30 days), and an “include thinking” toggle for search
+- **Filters** — project dropdown, time range (today / 7 / 30 / 90 days / 6 months / 1 year / custom start–end dates), and an “include thinking” toggle for search
 - **Paged loading** — a session opens with its latest 80 messages, viewed from the bottom; scrolling up loads earlier messages on demand
 - **Live tracking** — sessions written to within 2 minutes get a pulsing “in progress” badge; an open session polls for new messages and appends them incrementally, auto-following when you are at the bottom
 - **Subagent sidechains** — `<sessionId>/subagents/agent-*.jsonl` files are parsed separately; chips above the conversation switch between the main thread and each subagent
 - **Compaction awareness** — `summary` lines, `isCompactSummary` messages, and `compact_boundary` markers render as a summary banner, a collapsible block, and a divider respectively
 - **Tool-aware rendering** — Bash shows the command, Read/Write/Edit show file paths, Edit renders a red/green diff, todo lists / questions / subagent calls get structured cards; unknown tools fall back to JSON
-- **Markdown rendering** — message text and thinking rendered as Markdown, escaped before rendering (XSS-safe); search highlights survive rendering via sentinel characters
+- **Markdown rendering** — message text and thinking rendered as Markdown, including GFM tables (column alignment, `\|` escapes, horizontal scroll on narrow screens); escaped before rendering (XSS-safe); search highlights survive rendering via sentinel characters
 - **Favorites + notes** — star a session and attach a one-line note (stored in `favorites.json`)
 - **Message anchors** — deep links of the form `#s=project/session[/index]`; hover a message to copy its permalink
 - **Read-only sharing** — issue a 7-day, single-session, read-only link; guests get no sidebar, no list, no search
-- **Usage stats** — 📊 panel with totals, a 30-day daily output-token bar chart (hover for the full breakdown), and per-project / per-model tables (subagent usage included)
+- **Usage stats** — 📊 panel with a selectable time range (7 / 30 / 90 days, last year, this year, all time, or custom start–end); totals, bar chart and per-project / per-model tables all follow the range (subagent usage included). Bars roll up daily → weekly → monthly as the range grows
 - **Markdown export** — one click, sidechains and compaction summaries included
 - **Dark / light theme** — follows the system, manually cyclable, remembered in localStorage
 - **Mobile** — below 720 px the sidebar collapses into a drawer

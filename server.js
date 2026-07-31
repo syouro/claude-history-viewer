@@ -208,7 +208,10 @@ function parseSession(project, id, filePath) {
   let firstTs = null, lastTs = null;
   // token 用量统计（含子代理）
   const usage = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 };
-  const usageByDay = {}, usageByModel = {};
+  // usageByDay：日期 -> 模型 -> 用量（按天+按模型的汇总都从这里推，支持任意时间区间）
+  // 无时间戳的记录落在 '' 这一档，只计入「全部时间」
+  const usageByDay = {}, msgsByDay = {};
+  const zeroU = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 });
   const addU = (t, u, model) => {
     t.in += u.input_tokens || 0; t.out += u.output_tokens || 0;
     t.cw += u.cache_creation_input_tokens || 0; t.cr += u.cache_read_input_tokens || 0;
@@ -222,10 +225,8 @@ function parseSession(project, id, filePath) {
     const model = msg.model && msg.model !== '<synthetic>' ? msg.model : '(unknown)';
     addU(usage, u, model);
     const day = ts ? String(ts).slice(0, 10) : '';
-    if (day) addU(usageByDay[day] = usageByDay[day] ||
-      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 }, u, model);
-    addU(usageByModel[model] = usageByModel[model] ||
-      { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 }, u, model);
+    const byModel = usageByDay[day] = usageByDay[day] || {};
+    addU(byModel[model] = byModel[model] || zeroU(), u, model);
   };
   for (const line of raw.split('\n')) {
     const s = line.trim();
@@ -272,6 +273,8 @@ function parseSession(project, id, filePath) {
         !/^<(local-command|command-|user-)/.test(text)) {
       firstPrompt = text.slice(0, 200);
     }
+    const mday = ts ? String(ts).slice(0, 10) : '';
+    msgsByDay[mday] = (msgsByDay[mday] || 0) + 1;
     messages.push(m);
   }
   // 子代理侧链单独存放在 <sessionId>/subagents/agent-<agentId>.jsonl
@@ -304,7 +307,7 @@ function parseSession(project, id, filePath) {
     project, id, title: title || firstPrompt || '(无标题)', firstPrompt,
     cwd, gitBranch, agentName, mtime: stat.mtimeMs, firstTs, lastTs,
     msgCount: messages.length, summaries,
-    usage, usageByDay, usageByModel,
+    usage, usageByDay, msgsByDay,
     sidechains: chains, messages,
   };
 }
@@ -331,6 +334,12 @@ function sessionFile(project, id) {
     if (fs.existsSync(fp)) return fp;
   }
   return null;
+}
+
+// app.js 带 mtime 版本号，避开 CDN / 浏览器缓存（改完前端不用清缓存）
+const APP_JS = path.join(__dirname, 'app.js');
+function appVer() {
+  try { return String(Math.round(fs.statSync(APP_JS).mtimeMs)); } catch { return '0'; }
 }
 
 // ---------- 收藏（persist 到 favorites.json）----------
@@ -407,7 +416,7 @@ function summary(s) {
     cwd: s.cwd, gitBranch: s.gitBranch, agentName: s.agentName, mtime: s.mtime,
     firstTs: s.firstTs, lastTs: s.lastTs, msgCount: s.msgCount,
     sidechainCount: s.sidechains.length, hasSummary: s.summaries.length > 0,
-    usage: s.usage, usageByDay: s.usageByDay, usageByModel: s.usageByModel,
+    usage: s.usage, usageByDay: s.usageByDay, msgsByDay: s.msgsByDay,
   };
 }
 function search(q, includeThinking) {
@@ -520,13 +529,16 @@ const server = http.createServer(async (req, res) => {
   try {
     // 页面：始终可取（无数据），前端凭 /api/me 决定显示登录还是内容
     if (p === '/' || p === '/index.html') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(HTML);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+      res.end(HTML.replace('__APPVER__', appVer()));
       return;
     }
     if (p === '/app.js') {
-      res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
-      res.end(fs.readFileSync(path.join(__dirname, 'app.js')));
+      res.writeHead(200, {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'no-cache',
+      });
+      res.end(fs.readFileSync(APP_JS));
       return;
     }
     if (p === '/api/me') { sendJSON(res, { authed: isAuthed(req) }); return; }
@@ -633,6 +645,19 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, { ok: true, favs: FAVS }); return;
     }
     if (p === '/api/stats') {
+      // 时间区间：from/to 为 YYYY-MM-DD（含首含尾，UTC 日期），都不给则统计全部时间
+      const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+      const pick = (k) => {
+        const v = (url.searchParams.get(k) || '').slice(0, 10);
+        return DAY_RE.test(v) ? v : '';
+      };
+      const from = pick('from'), to = pick('to');
+      const ranged = !!(from || to);
+      const inRange = (day) => {
+        if (!ranged) return true;
+        if (!day) return false;               // 无时间戳的记录不计入具体区间
+        return (!from || day >= from) && (!to || day <= to);
+      };
       const days = {}, byProject = {}, byModel = {};
       const totals = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, sessions: 0, msgTotal: 0, cost: 0 };
       const zero = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 });
@@ -640,20 +665,38 @@ const server = http.createServer(async (req, res) => {
         t.in += u.in; t.out += u.out; t.cw += u.cw; t.cr += u.cr; t.msgs += u.msgs;
         t.cost += u.cost || 0;
       };
+      let minDay = '', maxDay = '';               // 全库数据的实际边界，给前端做「全部」区间
+      const bound = (day) => {
+        if (!day) return;
+        if (!minDay || day < minDay) minDay = day;
+        if (day > maxDay) maxDay = day;
+      };
       for (const s of listAll()) {
-        totals.sessions++; totals.msgTotal += s.msgCount;
-        if (s.usage) add(totals, s.usage);
-        for (const [day, u] of Object.entries(s.usageByDay || {}))
-          add(days[day] = days[day] || zero(), u);
-        if (s.usage && s.usage.msgs) {
-          const pj = byProject[s.project] = byProject[s.project] ||
-            { ...zero(), sessions: 0 };
-          add(pj, s.usage); pj.sessions++;
+        let hit = false;                          // 该会话在区间内是否有数据
+        for (const [day, models] of Object.entries(s.usageByDay || {})) {
+          bound(day);
+          if (!inRange(day)) continue;
+          hit = true;
+          const pj = byProject[s.project] = byProject[s.project] || { ...zero(), sessions: 0 };
+          for (const [m, u] of Object.entries(models)) {
+            add(totals, u);
+            add(byModel[m] = byModel[m] || zero(), u);
+            add(pj, u);
+            if (day) add(days[day] = days[day] || zero(), u);
+          }
         }
-        for (const [m, u] of Object.entries(s.usageByModel || {}))
-          add(byModel[m] = byModel[m] || zero(), u);
+        for (const [day, n] of Object.entries(s.msgsByDay || {})) {
+          bound(day);
+          if (!inRange(day)) continue;
+          hit = true; totals.msgTotal += n;
+        }
+        if (hit) {
+          totals.sessions++;
+          if (byProject[s.project]) byProject[s.project].sessions++;
+        }
       }
-      sendJSON(res, { totals, days, byProject, byModel }); return;
+      sendJSON(res, { totals, days, byProject, byModel, range: { from, to, minDay, maxDay } });
+      return;
     }
     if (p === '/api/search') {
       const inc = url.searchParams.get('thinking') === '1';
@@ -737,6 +780,9 @@ button,select,input{font-family:inherit}
   background:var(--field);color:var(--ink);font-size:13px;outline:none}
 #q:focus{border-color:var(--accent)}
 .filters{display:flex;gap:6px;margin-top:8px;align-items:center;flex-wrap:wrap}
+.fdates{display:flex;gap:5px;align-items:center;width:100%;font-size:11px;color:var(--muted)}
+.fdates input[type=date]{flex:1;min-width:0;padding:5px 7px;border:1px solid var(--line);
+  border-radius:8px;background:var(--field);color:var(--ink);font-size:11.5px;font-family:inherit}
 .filters select{flex:1;min-width:0;padding:6px 7px;border:1px solid var(--line);border-radius:8px;
   background:var(--field);color:var(--ink);font-size:12px}
 .chk{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap}
@@ -826,6 +872,13 @@ details.tool summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .md a{color:var(--accent)}
 .md hr{border:0;border-top:1px solid var(--line);margin:10px 0}
 .md strong{font-weight:660}
+/* Markdown 表格：窄屏时横向滚动，不撑破正文 */
+.md .tw{overflow-x:auto;margin:8px 0;-webkit-overflow-scrolling:touch}
+.md table.mtbl{border-collapse:collapse;font-size:12.5px;min-width:100%}
+.md table.mtbl th,.md table.mtbl td{border:1px solid var(--line);padding:5px 9px;
+  text-align:left;vertical-align:top;white-space:normal}
+.md table.mtbl th{background:var(--think);font-weight:640;white-space:nowrap}
+.md table.mtbl tbody tr:nth-child(even){background:rgba(127,127,127,.045)}
 .mdbody{padding:2px 12px 10px;max-height:360px;overflow:auto}
 .empty{color:var(--muted);text-align:center;margin-top:80px;font-size:13px}
 .mono{font-family:ui-monospace,Menlo,monospace}
@@ -878,6 +931,16 @@ mark.cur{outline:2px solid var(--accent);border-radius:3px}
 /* 用量统计面板 */
 .stats h3{font-size:13px;margin:22px 0 10px;color:var(--muted);font-weight:600;
   text-transform:uppercase;letter-spacing:.05em}
+/* 统计区间选择 */
+.rpick{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 14px}
+.rbtn{border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  border-radius:8px;padding:5px 11px;font-size:12px;cursor:pointer}
+.rbtn:hover{border-color:var(--accent)}
+.rbtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.rcustom{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted)}
+.rcustom input[type=date]{border:1px solid var(--line);background:var(--field);color:var(--ink);
+  border-radius:8px;padding:4px 8px;font-size:12px;font-family:inherit}
+.rnote{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
 .tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
 .tile .v{font-size:20px;font-weight:660;letter-spacing:-.01em}
@@ -935,8 +998,13 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <select id="ftime">
         <option value="0">任何时间</option><option value="1">今天</option>
         <option value="7">近 7 天</option><option value="30">近 30 天</option>
+        <option value="90">近 90 天</option><option value="180">近半年</option>
+        <option value="365">近一年</option><option value="custom">自定义…</option>
       </select>
       <label class="chk"><input type="checkbox" id="fthink">含思考</label>
+      <div class="fdates" id="fdates" style="display:none">
+        <input type="date" id="ffrom"><span>→</span><input type="date" id="fto">
+      </div>
     </div>
     <div id="meta"><span id="count"></span><span id="mode"></span></div>
   </header>
@@ -956,4 +1024,4 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     在搜索框输入关键词可跨全部会话搜正文</div></div>
 </main>
 
-<script src="app.js"></script></body></html>`;
+<script src="app.js?v=__APPVER__"></script></body></html>`;

@@ -67,12 +67,53 @@ function mdInline(s) {
   });
   return h;
 }
+// 表格：按 GFM 切单元格（\| 为转义竖线，首尾竖线可省）
+function mdCells(line) {
+  var s = line.trim();
+  if (s.charAt(0) === '|') s = s.slice(1);
+  if (s.charAt(s.length - 1) === '|' && s.charAt(s.length - 2) !== '\\') s = s.slice(0, -1);
+  var cells = [], cur = '';
+  for (var k = 0; k < s.length; k++) {
+    var c = s.charAt(k);
+    if (c === '\\' && s.charAt(k + 1) === '|') { cur += '|'; k++; continue; }
+    if (c === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += c;
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+function mdIsSep(l) {
+  if (l.indexOf('|') < 0) return false;
+  var cs = mdCells(l);
+  return cs.length > 0 && cs.every(function (c) { return /^:?-+:?$/.test(c); });
+}
+function mdTable(head, sep, rows) {
+  var aligns = mdCells(sep).map(function (c) {
+    var l = c.charAt(0) === ':', r = c.charAt(c.length - 1) === ':';
+    return l && r ? 'center' : r ? 'right' : l ? 'left' : '';
+  });
+  var hs = mdCells(head);
+  var cell = function (tag, txt, i) {
+    var a = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+    return '<' + tag + a + '>' + mdInline(txt) + '</' + tag + '>';
+  };
+  var out = '<div class="tw"><table class="mtbl"><thead><tr>' +
+    hs.map(function (c, i) { return cell('th', c, i); }).join('') + '</tr></thead><tbody>';
+  rows.forEach(function (r) {
+    var cs = mdCells(r), tr = '';
+    for (var i = 0; i < hs.length; i++) tr += cell('td', cs[i] === undefined ? '' : cs[i], i);
+    out += '<tr>' + tr + '</tr>';
+  });
+  return out + '</tbody></table></div>';
+}
 function mdBlocks(text) {
   var lines = text.split('\n'), html = [], i = 0, fence = BT + BT + BT;
   var isList = function (l) { return /^\s*([-*+]|\d+[.)])\s+/.test(l); };
-  var isBlock = function (l) {
+  // 表格要看下一行是不是分隔行（|---|---|），所以带一个 lookahead
+  var isTable = function (l, nx) { return l.indexOf('|') >= 0 && mdIsSep(nx || ''); };
+  var isBlock = function (l, nx) {
     return l.slice(0, 3) === fence || /^#{1,6}\s+/.test(l) || /^\s*>/.test(l) ||
-      isList(l) || /^\s*([-*_])\1\1+\s*$/.test(l);
+      isList(l) || /^\s*([-*_])\1\1+\s*$/.test(l) || isTable(l, nx);
   };
   while (i < lines.length) {
     var line = lines[i];
@@ -94,6 +135,15 @@ function mdBlocks(text) {
       while (i < lines.length && /^\s*>/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
       html.push('<blockquote>' + mdBlocks(q.join('\n')) + '</blockquote>'); continue;
     }
+    if (isTable(line, lines[i + 1])) {
+      var head = line, sep = lines[i + 1], rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].indexOf('|') >= 0 && !/^\s*$/.test(lines[i])) {
+        rows.push(lines[i]); i++;
+      }
+      html.push(mdTable(head, sep, rows));
+      continue;
+    }
     if (isList(line)) {
       var ordered = /^\s*\d+[.)]\s+/.test(line), items = [];
       while (i < lines.length && isList(lines[i])) {
@@ -106,7 +156,9 @@ function mdBlocks(text) {
     }
     if (/^\s*$/.test(line)) { i++; continue; }
     var para = [];
-    while (i < lines.length && !/^\s*$/.test(lines[i]) && !isBlock(lines[i])) { para.push(lines[i]); i++; }
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !isBlock(lines[i], lines[i + 1])) {
+      para.push(lines[i]); i++;
+    }
     html.push('<p>' + para.map(mdInline).join('<br>') + '</p>');
   }
   return html.join('');
@@ -118,11 +170,19 @@ function md(text, terms) {
 
 // ---------- 筛选 ----------
 function applyFilters(arr) {
-  var proj = $('#fproj').value, days = +$('#ftime').value;
-  var cut = days ? Date.now() - days * 86400e3 : 0;
+  var proj = $('#fproj').value, sel = $('#ftime').value;
+  var lo = 0, hi = Infinity;                       // 自定义区间按本地日历日，含首含尾
+  if (sel === 'custom') {
+    var f = $('#ffrom').value, t = $('#fto').value;
+    if (f) lo = new Date(f + 'T00:00:00').getTime();
+    if (t) hi = new Date(t + 'T23:59:59.999').getTime();
+  } else if (+sel) {
+    lo = Date.now() - (+sel) * 86400e3;
+  }
   return arr.filter(function (s) {
     if (proj && s.project !== proj) return false;
-    if (cut && tsOf(s) < cut) return false;
+    var ts = tsOf(s);
+    if (ts < lo || ts > hi) return false;
     return true;
   });
 }
@@ -657,28 +717,86 @@ function usageRow(name, u, extra) {
     '</td><td>' + fmtUSD(u.cost) + '</td></tr>';
 }
 var USAGE_TH = '<th>消息</th><th>输出</th><th>输入</th><th>缓存写</th><th>缓存读</th><th>花费（估算）</th>';
+// 统计区间（UTC 日期，与后端按 timestamp 切出来的天对齐）
+var statsRange = { preset: '30', from: '', to: '' };
+function dayStr(d) { return new Date(d).toISOString().slice(0, 10); }
+function shiftDay(day, n) { return dayStr(new Date(day + 'T00:00:00Z').getTime() + n * 86400e3); }
+function daysBetween(a, b) {
+  return Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400e3);
+}
+// 预设 -> {from,to}；'all' 交给后端（前端再用 range.minDay/maxDay 画图）
+function presetRange(p) {
+  var today = dayStr(Date.now());
+  if (p === 'all') return { from: '', to: '' };
+  if (p === 'year') return { from: today.slice(0, 4) + '-01-01', to: today };
+  if (p === 'custom') return { from: statsRange.from, to: statsRange.to };
+  return { from: shiftDay(today, -(+p - 1)), to: today };
+}
+// 区间太长时按周 / 月并柱，柱子数控制在 ~100 根以内
+function bucketDays(from, to, daysMap) {
+  var span = Math.max(1, Math.min(daysBetween(from, to) + 1, 3660));
+  var unit = span <= 100 ? 'day' : span <= 400 ? 'week' : 'month';
+  var list = [], index = {};
+  for (var i = 0; i < span; i++) {
+    var day = shiftDay(from, i);
+    var key = unit === 'day' ? day
+      : unit === 'week' ? shiftDay(from, Math.floor(i / 7) * 7)
+      : day.slice(0, 7);
+    var b = index[key];
+    if (!b) {
+      b = index[key] = {
+        key: key, from: day, to: day,
+        label: unit === 'month' ? key : key.slice(5),
+        u: { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 },
+      };
+      list.push(b);
+    }
+    b.to = day;
+    var u = daysMap[day];
+    if (u) {
+      b.u.in += u.in; b.u.out += u.out; b.u.cw += u.cw; b.u.cr += u.cr;
+      b.u.msgs += u.msgs; b.u.cost += u.cost || 0;
+    }
+  }
+  return { unit: unit, list: list };
+}
+var UNIT_CN = { day: '每日', week: '每周', month: '每月' };
 async function openStats() {
-  var st = await (await fetch('api/stats')).json();
+  var r = presetRange(statsRange.preset);
+  var qs = [];
+  if (r.from) qs.push('from=' + r.from);
+  if (r.to) qs.push('to=' + r.to);
+  var st = await (await fetch('api/stats' + (qs.length ? '?' + qs.join('&') : ''))).json();
   current = null; view.mode = 'stats'; clearTimeout(liveTimer);
   $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
-  // 近 30 天逐日序列（缺的日期补零）
-  var days = [], today = new Date();
-  for (var i = 29; i >= 0; i--) {
-    var d = new Date(today.getTime() - i * 86400e3);
-    days.push(d.toISOString().slice(0, 10));
-  }
-  var series = days.map(function (day) { return { day: day, u: st.days[day] || null }; });
-  var max = Math.max.apply(0, series.map(function (s) { return s.u ? s.u.out : 0; })) || 1;
-  var bars = '', labels = '', peak = '';
+  // 「全部」用库里数据的真实边界当区间；空库退化成今天
+  var today = dayStr(Date.now());
+  var cFrom = r.from || st.range.minDay || today;
+  var cTo = r.to || st.range.maxDay || today;
+  if (cTo < cFrom) cTo = cFrom;
+  var bk = bucketDays(cFrom, cTo, st.days || {});
+  var series = bk.list;
+  var max = Math.max.apply(0, series.map(function (s) { return s.u.out; })) || 1;
+  var bars = '', labels = '', peak = '', lblEvery = Math.ceil(series.length / 8);
   series.forEach(function (s, i) {
-    var out = s.u ? s.u.out : 0;
-    var h = Math.round(out / max * 100);
+    var h = Math.round(s.u.out / max * 100);
     bars += '<div class="cbar" data-i="' + i + '"><i style="height:' + h + '%"></i></div>';
-    labels += '<span>' + (i % 5 === 0 ? s.day.slice(5) : '') + '</span>';
-    if (out === max && out > 0 && !peak)
-      peak = '<div class="cpeak" style="left:' + ((i + 0.5) / 30 * 100) + '%;top:2px">' +
-        fmtTok(out) + '</div>';
+    labels += '<span>' + (i % lblEvery === 0 ? s.label : '') + '</span>';
+    if (s.u.out === max && max > 0 && !peak)
+      peak = '<div class="cpeak" style="left:' + ((i + 0.5) / series.length * 100) +
+        '%;top:2px">' + fmtTok(s.u.out) + '</div>';
   });
+  var presets = [['7', '近 7 天'], ['30', '近 30 天'], ['90', '近 90 天'], ['365', '近一年'],
+    ['year', '今年'], ['all', '全部'], ['custom', '自定义']];
+  var picker = '<div class="rpick">' + presets.map(function (p) {
+    return '<button class="rbtn' + (statsRange.preset === p[0] ? ' on' : '') +
+      '" data-p="' + p[0] + '">' + p[1] + '</button>';
+  }).join('') +
+    '<span class="rcustom"' + (statsRange.preset === 'custom' ? '' : ' style="display:none"') +
+    '><input type="date" id="rfrom" value="' + (statsRange.from || cFrom) + '">' +
+    '<span>→</span><input type="date" id="rto" value="' + (statsRange.to || cTo) + '">' +
+    '<button class="rbtn" id="rgo">查询</button></span>' +
+    '<span class="rnote">' + cFrom + ' ~ ' + cTo + '（UTC）</span></div>';
   var t = st.totals;
   var projRows = Object.keys(st.byProject).sort(function (a, b) {
     return st.byProject[b].out - st.byProject[a].out;
@@ -689,14 +807,14 @@ async function openStats() {
   var modelRows = Object.keys(st.byModel).sort(function (a, b) {
     return st.byModel[b].out - st.byModel[a].out;
   }).map(function (m) { return usageRow(m, st.byModel[m]); }).join('');
-  $('#conv').innerHTML = '<div class="wrap stats">' +
+  $('#conv').innerHTML = '<div class="wrap stats">' + picker +
     '<div class="tiles">' +
     tile(t.sessions, '会话') + tile(t.msgTotal, '消息') +
     tile(fmtTok(t.out), '输出 token') + tile(fmtTok(t.in), '输入 token') +
     tile(fmtTok(t.cw), '缓存写入') + tile(fmtTok(t.cr), '缓存读取') +
     tile(fmtUSD(t.cost), '花费（估算）') +
     '</div>' +
-    '<h3>近 30 天 · 每日输出 token</h3>' +
+    '<h3>' + UNIT_CN[bk.unit] + '输出 token</h3>' +
     '<div class="chart">' + peak + '<div class="cbars">' + bars + '</div>' +
     '<div class="cxl">' + labels + '</div><div class="ctip" id="ctip"></div></div>' +
     '<h3>按项目</h3><div class="tblwrap"><table class="stbl">' +
@@ -705,13 +823,34 @@ async function openStats() {
     '<tr><th>模型</th>' + USAGE_TH + '</tr>' + modelRows + '</table></div>' +
     '</div>';
   $('#conv').scrollTop = 0;
-  // 悬浮提示：逐条柱子显示当日完整拆解
+  // 区间选择
+  $('#conv').querySelectorAll('.rbtn[data-p]').forEach(function (b) {
+    b.onclick = function () {
+      var p = b.dataset.p;
+      if (p === 'custom' && statsRange.preset !== 'custom') {
+        if (!statsRange.from) { statsRange.from = cFrom; statsRange.to = cTo; }
+      }
+      statsRange.preset = p;
+      openStats();
+    };
+  });
+  if ($('#rgo')) {
+    $('#rgo').onclick = function () {
+      var f = $('#rfrom').value, tt = $('#rto').value;
+      if (!f || !tt) return;
+      if (f > tt) { var sw = f; f = tt; tt = sw; }
+      statsRange = { preset: 'custom', from: f, to: tt };
+      openStats();
+    };
+  }
+  // 悬浮提示：逐条柱子显示当格完整拆解
   var tip = $('#ctip');
   document.querySelectorAll('.cbar').forEach(function (bar) {
     bar.addEventListener('mouseenter', function () {
       var s = series[+bar.dataset.i];
-      var u = s.u || { out: 0, in: 0, cw: 0, cr: 0, msgs: 0, cost: 0 };
-      tip.innerHTML = '<b>' + s.day + '</b><br>输出 ' + fmtTok(u.out) +
+      var u = s.u;
+      var head = s.from === s.to ? s.from : s.from + ' ~ ' + s.to;
+      tip.innerHTML = '<b>' + head + '</b><br>输出 ' + fmtTok(u.out) +
         ' · 输入 ' + fmtTok(u.in) + '<br>缓存写 ' + fmtTok(u.cw) +
         ' · 读 ' + fmtTok(u.cr) + '<br>' + u.msgs + ' 条回复 · ' + fmtUSD(u.cost);
       tip.style.display = 'block';
@@ -773,7 +912,21 @@ $('#q').addEventListener('keydown', function (e) {
   if (e.key === 'Escape') { e.target.value = ''; searchMode = false; render(''); }
 });
 $('#fproj').addEventListener('change', reRun);
-$('#ftime').addEventListener('change', reRun);
+$('#ftime').addEventListener('change', function () {
+  var custom = $('#ftime').value === 'custom';
+  $('#fdates').style.display = custom ? 'flex' : 'none';
+  if (custom && !$('#ffrom').value) {                 // 首次切过来给个近 30 天的默认区间
+    var today = new Date();
+    var local = function (d) {
+      return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+    };
+    $('#fto').value = local(today);
+    $('#ffrom').value = local(new Date(today.getTime() - 29 * 86400e3));
+  }
+  reRun();
+});
+$('#ffrom').addEventListener('change', reRun);
+$('#fto').addEventListener('change', reRun);
 $('#fthink').addEventListener('change', reRun);
 $('#theme').onclick = function () {
   var cur = document.documentElement.getAttribute('data-theme');
