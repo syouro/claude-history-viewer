@@ -45,6 +45,11 @@
   - 搜索：先用 blob 粗筛（全词命中才算候选），**只有候选才 `loadSession` 全量解析**算精确命中数与片段。
   - 落盘走 3s 防抖 + 退出 flush；改了 `parseSession` / `summary` 结构后删掉这两个文件重建。
 
+## 删除会话
+
+- `deleteSession()`：`fs.unlinkSync` 删 `.jsonl` + `fs.rmSync` 删 `<id>/subagents` 目录，并清 cache/INDEX/BLOBS/FAVS。
+- **不可恢复**。`POST /api/delete` 仅登录可用（`if (!authed)` 之后），**不接受分享 token**；前端二次 `confirm`。
+
 ## 运行 / 调试
 
 ```bash

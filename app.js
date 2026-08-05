@@ -309,8 +309,10 @@ async function open(s, jumpIdx) {
       '&id=' + encodeURIComponent(data.id) + shareQ();
     a.download = ''; document.body.appendChild(a); a.click(); a.remove();
   };
+  $('#del').onclick = function () { delSession(data); };
   if (SHARE) {
     $('#fav').style.display = 'none'; $('#share').style.display = 'none';
+    $('#del').style.display = 'none'; // 访客只读，不能删
     $('#sub').innerHTML += '<span class="robadge">只读分享</span>';
   }
   syncFavUI(data);
@@ -369,6 +371,26 @@ async function setFav(s, fav, note) {
   if (JSON.stringify(favs[favKey(s)] || null) === old) return; // 无变化不重绘
   if (current && current.id === s.id) syncFavUI(s);
   render($('#q').value.trim());
+}
+
+// ---------- 删除会话（删磁盘上的 .jsonl，不可恢复）----------
+async function delSession(s) {
+  if (!confirm('删除这段对话？\n\n将删除磁盘上的对话文件（含子代理侧链），不可恢复。')) return;
+  var r = await fetch('api/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project: s.project, id: s.id })
+  });
+  var j = await r.json().catch(function () { return {}; });
+  if (!j.ok) { alert('删除失败：' + (j.error || r.status)); return; }
+  sessions = sessions.filter(function (x) { return favKey(x) !== favKey(s); });
+  delete favs[favKey(s)];
+  if (current && favKey(current) === favKey(s)) {   // 关掉正在看的这段
+    current = null; clearTimeout(liveTimer);
+    $('#top').style.display = 'none'; $('#chains').style.display = 'none';
+    $('#conv').innerHTML = '<div class="empty">对话已删除</div>';
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  if (searchMode) doSearch($('#q').value.trim()); else render($('#q').value.trim());
 }
 
 // ---------- 只读分享 ----------

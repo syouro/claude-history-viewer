@@ -164,4 +164,15 @@ test('blob stamp 过期时自愈重建（改文件后仍能搜到新内容）', 
   assert.equal(S.search('alpaca', false).length, 0);      // 旧内容已不在
 });
 
+test('deleteSession：删文件、清索引，搜索/列表随之消失', () => {
+  const fp = writeSession('proj-d', 's4', [usr('待删 gonna-delete'), asst('ok')]);
+  S.refreshIndex(true);
+  assert.ok(S.listAll().some((x) => x.id === 's4'));
+  assert.equal(S.deleteSession('proj-d', 's4'), true);
+  assert.equal(fs.existsSync(fp), false);                 // 磁盘文件已删
+  assert.ok(!S.listAll().some((x) => x.id === 's4'));
+  assert.equal(S.deleteSession('proj-d', 's4'), false);   // 再删返回 false
+  assert.equal(S.deleteSession('../evil', 'x'), false);   // 路径穿越被拒
+});
+
 test.after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* */ } });

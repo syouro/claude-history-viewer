@@ -519,6 +519,21 @@ function loadSession(project, id) {
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   return session;
 }
+// 删除会话：删掉 .jsonl 与其 <id>/subagents 目录，并清掉各级缓存 / 索引 / 收藏
+function deleteSession(project, id) {
+  if (!NAME_RE.test(project || '') || !NAME_RE.test(id || '')) return false;
+  if (isExcluded(project)) return false;
+  const filePath = sessionFile(project, id);
+  if (!filePath) return false;
+  try { fs.unlinkSync(filePath); } catch { return false; }
+  try { fs.rmSync(filePath.slice(0, -6), { recursive: true, force: true }); } catch { /* 无子代理目录 */ }
+  const key = project + '/' + id;
+  cache.delete(key); INDEX.delete(key);
+  if (BLOBS) BLOBS.delete(key);
+  scheduleSave(); if (BLOBS) scheduleBlobSave();
+  if (FAVS[key]) { delete FAVS[key]; saveFavs(); }
+  return true;
+}
 function listAll() {
   refreshIndex();
   const out = [];
@@ -772,6 +787,18 @@ const server = http.createServer(async (req, res) => {
       saveFavs();
       sendJSON(res, { ok: true, favs: FAVS }); return;
     }
+    // 删除会话：删掉磁盘上的 .jsonl（含子代理目录），仅登录可用、不接受分享 token
+    if (p === '/api/delete' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
+        sendJSON(res, { error: 'bad request' }, 400); return;
+      }
+      if (!deleteSession(body.project, body.id)) {
+        sendJSON(res, { error: 'not found' }, 404); return;
+      }
+      sendJSON(res, { ok: true }); return;
+    }
     if (p === '/api/stats') {
       // 时间区间：from/to 为 YYYY-MM-DD（含首含尾，UTC 日期），都不给则统计全部时间
       const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -840,7 +867,7 @@ const server = http.createServer(async (req, res) => {
 module.exports = {
   globToRe, isExcluded, extractBlocks, toolResultText, plainText,
   priceFor, costOf, parseSession, searchBlobs, indexEntry,
-  refreshIndex, listAll, search, loadSession, summary, INDEX,
+  refreshIndex, listAll, search, loadSession, deleteSession, summary, INDEX,
   saveIndex, saveBlobs, // 供测试强制落盘（生产走 3s 防抖）
 };
 
@@ -953,9 +980,11 @@ mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}
 #top h2{margin:0;font-size:16px}
 #top .sub{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:14px;flex-wrap:wrap}
 .tbtns{display:flex;gap:8px;align-items:flex-start}
-#exp,#fav,#share{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
+#exp,#fav,#share,#del{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
   padding:7px 12px;font-size:12.5px;cursor:pointer;white-space:nowrap}
 #exp:hover,#fav:hover,#share:hover{border-color:var(--accent)}
+#del{color:#d64545}
+#del:hover{border-color:#d64545;background:rgba(214,69,69,.08)}
 .robadge{background:var(--accent-soft);color:var(--accent);border-radius:8px;
   padding:1px 8px;font-size:11px;font-weight:600}
 #fav.on{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
@@ -1160,7 +1189,8 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <input id="favnote" placeholder="收藏备注，回车保存" style="display:none"></div>
     <div class="tbtns"><button id="fav" title="收藏">☆</button>
       <button id="share" title="生成 7 天有效的只读分享链接">分享</button>
-      <button id="exp">导出 MD</button></div></div>
+      <button id="exp">导出 MD</button>
+      <button id="del" title="删除对话文件（不可恢复）">删除</button></div></div>
   <div id="chains"></div>
   <div id="hitbar"><span id="hitn"></span>
     <button id="hitPrev" title="上一处">↑</button><button id="hitNext" title="下一处">↓</button></div>
