@@ -2,6 +2,9 @@
 secret.json
 config.json
 favorites.json
+index.json
+index.blobs.json
+*.json.tmp
 nginx.conf.bak
 *.log
 node_modules/

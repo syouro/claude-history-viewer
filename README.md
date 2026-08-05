@@ -61,14 +61,38 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 | `VIEWER_PASSWORD` | 无 | 覆盖 secret.json 里的密码 |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | 整体覆盖 `roots`（只支持单个目录） |
 | `CONFIG_PATH` | `./config.json` | 配置文件路径 |
+| `INDEX_PATH` | `./index.json` | 会话摘要索引文件路径 |
+| `INDEX_BLOBS_PATH` | `./index.blobs.json` | 搜索 blob 文件路径 |
+| `BLOB_TTL_MS` | `300000` | 搜索 blob 闲置多久后释放内存（毫秒） |
+
+## 索引
+
+列表 / 统计 / 搜索走一层持久化索引，并把「常驻」与「大块」分开，让平时只看历史时内存占用很小：
+
+- `index.json`：会话**摘要**索引（无消息体），常驻内存，列表 / 统计只碰它。摘要小，常驻不肉疼。
+- `index.blobs.json`：搜索用的**正文/思考 blob**（体量大）。**惰性从盘上读入**，闲置 `BLOB_TTL_MS`
+  后**释放内存**；只在搜索时才载入。搜索先用 blob 粗筛，**只有命中候选才全量解析** jsonl 算精确
+  命中数与片段——会话再多也不会每次搜索都把全部文件重解析一遍。
+
+两个索引都以文件 mtime（含子代理文件）为失效键增量刷新；blob 自带 stamp，与摘要不符即按需重建（自愈）。
+结构随时可删，下次请求自动重建。改了 `parseSession` / `summary` 的输出结构后，删掉这两个文件让它重建。
+
+## 测试
+
+```bash
+node --test        # test/ 下的 node:test 用例，零依赖
+```
 
 ## 文件
 
 - `server.js` — 后端 + 内嵌 HTML/CSS
 - `app.js` — 前端逻辑（由 `/app.js` 路由提供，含 Markdown 渲染器）
+- `test/` — `node:test` 用例（纯函数 + `parseSession` + 索引）
 - `config.json` — 服务配置（扫描根目录、例外、端口等）
 - `secret.json` — 密钥与密码（自动生成，勿入库）
 - `favorites.json` — 收藏与备注（自动生成，勿入库）
+- `index.json` — 会话摘要索引（自动生成、可安全删除重建，勿入库）
+- `index.blobs.json` — 搜索用正文/思考 blob（惰性读盘、闲置释放，勿入库）
 
 ## 功能
 

@@ -350,12 +350,156 @@ function saveFavs() {
   try { fs.writeFileSync(FAVS_PATH, JSON.stringify(FAVS, null, 2)); } catch { /* */ }
 }
 
-// ---------- 缓存 ----------
-// 全量会话缓存带 LRU 上限（消息占内存）；摘要缓存无消息、常驻，列表接口只碰它。
+// ---------- 缓存 + 磁盘索引 ----------
+// cache：全量会话（含消息体）LRU，按需加载，仅打开会话 / 搜索命中候选时填充。
+// INDEX：轻量摘要索引（无消息体），常驻内存 + 持久化 index.json，列表 / 统计只碰它。摘要小，常驻不肉疼。
+// BLOBS：搜索用的小写正文/思考 blob，体量大 —— 惰性从 blobs.json 读盘，闲置 BLOB_TTL 后释放内存。
+//   搜索先用 blob 粗筛，只有命中候选才回落到全量解析。blob 自带 stamp，与摘要 stamp 不符即按需重建。
 const cache = new Map();
 const CACHE_MAX = 100;
-const sumCache = new Map(); // key -> {mtime, summary}
 const NAME_RE = /^[A-Za-z0-9._-]+$/; // 防路径穿越
+const INDEX_PATH = process.env.INDEX_PATH || path.join(__dirname, 'index.json');
+const BLOBS_PATH = process.env.INDEX_BLOBS_PATH || INDEX_PATH.replace(/\.json$/, '') + '.blobs.json';
+const BLOB_TTL = Number(process.env.BLOB_TTL_MS) || 5 * 60 * 1000; // 闲置多久后释放 blob 内存
+const INDEX = new Map(); // key -> { stamp, summary }
+(function loadIndex() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(INDEX_PATH, 'utf8'));
+    if (raw && raw.version === 2 && raw.entries)
+      for (const [k, v] of Object.entries(raw.entries)) INDEX.set(k, v);
+  } catch { /* 无索引或旧版本 → 首次请求时重建 */ }
+})();
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(saveIndex, 3000);
+  if (saveTimer.unref) saveTimer.unref();
+}
+function saveIndex() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  writeJsonAtomic(INDEX_PATH, { version: 2, entries: Object.fromEntries(INDEX) });
+}
+function writeJsonAtomic(fp, obj) {
+  try {
+    const tmp = fp + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(obj));
+    fs.renameSync(tmp, fp); // 原子替换，避免读到半截文件
+  } catch { /* ignore */ }
+}
+
+// ---- blob（惰性载入 / 闲置释放）----
+let BLOBS = null;          // key -> { stamp, text, think }；null = 未载入 / 已释放
+let blobsDirty = false, blobsAccess = 0, blobsTimer = null;
+function armBlobRelease() {
+  blobsAccess = Date.now();
+  if (blobsTimer) return;
+  blobsTimer = setTimeout(releaseBlobs, BLOB_TTL);
+  if (blobsTimer.unref) blobsTimer.unref();
+}
+function releaseBlobs() {
+  blobsTimer = null;
+  if (Date.now() - blobsAccess < BLOB_TTL - 500) { armBlobRelease(); return; } // 期间又用过，续期
+  if (blobsDirty) saveBlobs();
+  BLOBS = null;             // 释放大块内存，下次搜索再从盘上读回
+}
+function ensureBlobs() {
+  armBlobRelease();
+  if (BLOBS) return BLOBS;
+  BLOBS = new Map();
+  try {
+    const raw = JSON.parse(fs.readFileSync(BLOBS_PATH, 'utf8'));
+    if (raw && raw.version === 1 && raw.blobs)
+      for (const [k, v] of Object.entries(raw.blobs)) BLOBS.set(k, v);
+  } catch { /* 无文件或损坏 → 缺失的 blob 按需重建 */ }
+  return BLOBS;
+}
+function saveBlobs() {
+  if (!BLOBS) return;
+  writeJsonAtomic(BLOBS_PATH, { version: 1, blobs: Object.fromEntries(BLOBS) });
+  blobsDirty = false;
+}
+// 搜索 blob：正文（含工具名）与思考分开存，粗筛时按「含思考」开关决定是否并入
+function searchBlobs(s) {
+  let text = '', think = '';
+  const add = (m) => {
+    if (m.isMeta) return;
+    for (const b of m.blocks) {
+      const t = b.text || (b.kind === 'tool_use' ? b.name : '');
+      if (!t) continue;
+      if (b.kind === 'thinking') think += t.toLowerCase() + '\n';
+      else text += t.toLowerCase() + '\n';
+    }
+  };
+  for (const m of s.messages) add(m);
+  for (const sc of s.sidechains) for (const m of sc.messages) add(m);
+  return { text, think };
+}
+// 取某会话的 blob：blobs.json 里缺失 / stamp 过期就解析该会话重建（自愈）
+function blobFor(project, id) {
+  const key = project + '/' + id;
+  const stamp = INDEX.get(key) && INDEX.get(key).stamp;
+  const store = ensureBlobs();
+  let b = store.get(key);
+  if (b && b.stamp === stamp) return b;
+  const s = loadSession(project, id);
+  if (!s) return { stamp, text: '', think: '' };
+  b = { stamp, ...searchBlobs(s) };
+  store.set(key, b);
+  blobsDirty = true; scheduleBlobSave();
+  return b;
+}
+let blobSaveTimer = null;
+function scheduleBlobSave() {
+  if (blobSaveTimer) return;
+  blobSaveTimer = setTimeout(() => { blobSaveTimer = null; if (blobsDirty) saveBlobs(); }, 3000);
+  if (blobSaveTimer.unref) blobSaveTimer.unref();
+}
+function indexEntry(session, stamp) { return { stamp, summary: summary(session) }; }
+
+// 扫描各根目录增量刷新 INDEX（只更新摘要，不碰 blob）；目录遍历有成本，1s 节流
+let lastScan = 0;
+function refreshIndex(force) {
+  const now = Date.now();
+  if (!force && now - lastScan < 1000) return;
+  lastScan = now;
+  const live = new Set();
+  let changed = false;
+  for (const root of ROOTS) {
+    let projects;
+    try { projects = fs.readdirSync(root); } catch { continue; }
+    for (const project of projects) {
+      if (isExcluded(project) || !NAME_RE.test(project)) continue;
+      const pdir = path.join(root, project);
+      let files;
+      try {
+        if (!fs.statSync(pdir).isDirectory()) continue;
+        files = fs.readdirSync(pdir).filter((f) => f.endsWith('.jsonl'));
+      } catch { continue; }
+      for (const f of files) {
+        const id = f.slice(0, -6);
+        if (!NAME_RE.test(id)) continue;
+        const key = project + '/' + id;
+        if (live.has(key)) continue; // 同名会话多根并存时先配置的根优先
+        live.add(key);
+        let stamp;
+        try { stamp = cacheStamp(path.join(pdir, f)); } catch { continue; }
+        const hit = INDEX.get(key);
+        if (hit && hit.stamp === stamp) continue; // 未变，跳过重解析
+        try {
+          const s = parseSession(project, id, path.join(pdir, f));
+          if (!s.msgCount) { if (INDEX.delete(key)) changed = true; continue; }
+          INDEX.set(key, indexEntry(s, stamp));
+          if (BLOBS) { BLOBS.set(key, { stamp, ...searchBlobs(s) }); blobsDirty = true; } // 已载入才顺带更新
+          changed = true;
+        } catch { /* skip */ }
+      }
+    }
+  }
+  for (const key of [...INDEX.keys()]) {          // 清理已删除 / 已排除的会话
+    if (!live.has(key)) { INDEX.delete(key); if (BLOBS) BLOBS.delete(key); changed = true; }
+  }
+  if (changed) { scheduleSave(); if (BLOBS && blobsDirty) scheduleBlobSave(); }
+}
 function loadSession(project, id) {
   if (!NAME_RE.test(project || '') || !NAME_RE.test(id || '')) return null;
   if (isExcluded(project)) return null;
@@ -370,42 +514,17 @@ function loadSession(project, id) {
   }
   const session = parseSession(project, id, filePath);
   cache.set(key, { stamp, session });
-  sumCache.set(key, { stamp, summary: summary(session) });
+  const ie = INDEX.get(key);              // 顺带刷新摘要索引，保持索引与打开的会话同步
+  if (!ie || ie.stamp !== stamp) { INDEX.set(key, indexEntry(session, stamp)); scheduleSave(); }
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   return session;
 }
-function loadSummary(project, id, stamp) {
-  const key = project + '/' + id;
-  const hit = sumCache.get(key);
-  if (hit && hit.stamp === stamp) return hit.summary;
-  const s = loadSession(project, id);
-  return s ? summary(s) : null;
-}
 function listAll() {
+  refreshIndex();
   const out = [];
-  const seen = new Set(); // 同名项目+会话在多个根里出现时，先配置的根优先
-  for (const root of ROOTS) {
-    let projects;
-    try { projects = fs.readdirSync(root); } catch { continue; }
-    for (const project of projects) {
-      if (isExcluded(project)) continue;
-      const pdir = path.join(root, project);
-      let files;
-      try {
-        if (!fs.statSync(pdir).isDirectory()) continue;
-        files = fs.readdirSync(pdir).filter((f) => f.endsWith('.jsonl'));
-      } catch { continue; }
-      for (const f of files) {
-        const id = f.slice(0, -6);
-        const key = project + '/' + id;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        try {
-          const s = loadSummary(project, id, cacheStamp(path.join(pdir, f)));
-          if (s && s.msgCount) out.push(s);
-        } catch { /* skip */ }
-      }
-    }
+  for (const e of INDEX.values()) {
+    if (isExcluded(e.summary.project)) continue;
+    if (e.summary.msgCount) out.push(e.summary);
   }
   out.sort((a, b) => b.mtime - a.mtime);
   return out;
@@ -423,12 +542,22 @@ function search(q, includeThinking) {
   const query = q.toLowerCase().trim();
   if (!query) return [];
   const terms = query.split(/\s+/).filter(Boolean);
+  refreshIndex();
   const results = [];
-  for (const sum of listAll()) {
-    const s = loadSession(sum.project, sum.id);
+  for (const e of INDEX.values()) {
+    const sum = e.summary;
+    if (isExcluded(sum.project)) continue;
+    const titleLc = (sum.title + ' ' + (sum.firstPrompt || '')).toLowerCase();
+    const titleHit = terms.every((term) => titleLc.includes(term));
+    // 粗筛：全部词都在正文（或含思考时并入思考）blob 里，才可能有精确命中
+    const blob = blobFor(sum.project, sum.id);
+    const hay = includeThinking ? blob.text + '\n' + blob.think : blob.text;
+    const bodyCand = terms.every((term) => hay.includes(term));
+    if (!bodyCand && !titleHit) continue;
+    if (!bodyCand) { results.push({ ...sum, hits: 0, titleHit: true, snippet: null }); continue; }
+    const s = loadSession(sum.project, sum.id); // 命中候选才全量解析，逐块算精确命中数与片段
     if (!s) continue;
     let hits = 0, snippet = null;
-    const titleLc = (s.title + ' ' + s.firstPrompt).toLowerCase();
     const scan = (m, side) => {
       if (m.isMeta) return;
       for (const b of m.blocks) {
@@ -444,7 +573,6 @@ function search(q, includeThinking) {
     };
     for (const m of s.messages) scan(m, false);
     for (const sc of s.sidechains) for (const m of sc.messages) scan(m, true);
-    const titleHit = terms.every((term) => titleLc.includes(term));
     if (hits || titleHit) results.push({ ...summary(s), hits, titleHit, snippet });
   }
   results.sort((a, b) => (b.hits + (b.titleHit ? 0.5 : 0)) -
@@ -708,21 +836,37 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-const generated = loadConfig();
-server.listen(PORT, HOST, () => {
-  console.log(`Claude 历史查看器：http://${HOST}:${PORT}`);
-  console.log('  扫描根目录：' + ROOTS.join('，'));
-  if (EXCLUDE.length) console.log('  排除规则：' + (USER_CFG.exclude || []).join('，'));
-  if (generated) {
-    console.log('\n  ⚠ 已生成随机登录密码（也写入 secret.json）：');
-    console.log('      ' + generated + '\n');
-  } else if (process.env.VIEWER_PASSWORD) {
-    console.log('  登录密码来自 VIEWER_PASSWORD 环境变量');
-  } else {
-    console.log('  登录密码来自 secret.json');
-  }
-  if (!SECURE_COOKIE) console.log('  （SECURE_COOKIE=0：cookie 不带 Secure，仅供本地 http 调试）');
-});
+// 供 node:test 复用纯函数（被 require 时不启动服务器）
+module.exports = {
+  globToRe, isExcluded, extractBlocks, toolResultText, plainText,
+  priceFor, costOf, parseSession, searchBlobs, indexEntry,
+  refreshIndex, listAll, search, loadSession, summary, INDEX,
+  saveIndex, saveBlobs, // 供测试强制落盘（生产走 3s 防抖）
+};
+
+if (require.main === module) {
+  const generated = loadConfig();
+  server.listen(PORT, HOST, () => {
+    console.log(`Claude 历史查看器：http://${HOST}:${PORT}`);
+    console.log('  扫描根目录：' + ROOTS.join('，'));
+    if (EXCLUDE.length) console.log('  排除规则：' + (USER_CFG.exclude || []).join('，'));
+    if (generated) {
+      console.log('\n  ⚠ 已生成随机登录密码（也写入 secret.json）：');
+      console.log('      ' + generated + '\n');
+    } else if (process.env.VIEWER_PASSWORD) {
+      console.log('  登录密码来自 VIEWER_PASSWORD 环境变量');
+    } else {
+      console.log('  登录密码来自 secret.json');
+    }
+    if (!SECURE_COOKIE) console.log('  （SECURE_COOKIE=0：cookie 不带 Secure，仅供本地 http 调试）');
+    // 启动后台预热索引（不阻塞 listen 回调），首个请求即可命中缓存
+    setTimeout(() => { try { refreshIndex(true); } catch { /* */ } }, 100).unref?.();
+  });
+  // 退出前把索引与 blob 落盘（pm2 stop / Ctrl-C）
+  const flush = () => { try { saveIndex(); if (blobsDirty) saveBlobs(); } finally { process.exit(0); } };
+  process.on('SIGINT', flush);
+  process.on('SIGTERM', flush);
+}
 
 // ---------- 前端（内嵌单页）----------
 const HTML = /* html */ `<!doctype html><html lang="zh"><head>
