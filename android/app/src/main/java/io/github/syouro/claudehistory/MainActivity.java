@@ -1,24 +1,34 @@
 package io.github.syouro.claudehistory;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Bundle;
+import android.text.InputType;
 import android.view.KeyEvent;
 import android.webkit.CookieManager;
+import android.webkit.HttpAuthHandler;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.EditText;
+import android.widget.LinearLayout;
 
 public class MainActivity extends Activity {
     static final String PREFS = "viewer";
     static final String KEY_URL = "serverUrl";
+    static final String KEY_HTTP_USER = "httpUser";
+    static final String KEY_HTTP_PASS = "httpPass";
 
     private WebView web;
     private String home = "";
+    private boolean triedSavedAuth = false;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -41,6 +51,25 @@ public class MainActivity extends Activity {
 
         web.setWebChromeClient(new WebChromeClient());
         web.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView v, String url, Bitmap favicon) {
+                triedSavedAuth = false;
+            }
+
+            // 反代加了 HTTP Basic Auth 时 WebView 不会弹浏览器那种登录框，这里补上：
+            // 先用记住的凭据静默尝试，失败（或还没存过）再弹原生对话框
+            @Override
+            public void onReceivedHttpAuthRequest(WebView v, HttpAuthHandler h, String host, String realm) {
+                SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+                String u = p.getString(KEY_HTTP_USER, "");
+                if (!triedSavedAuth && !u.isEmpty()) {
+                    triedSavedAuth = true;
+                    h.proceed(u, p.getString(KEY_HTTP_PASS, ""));
+                    return;
+                }
+                askHttpAuth(h, host, u);
+            }
+
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest req) {
                 Uri u = req.getUrl();
@@ -85,6 +114,34 @@ public class MainActivity extends Activity {
 
     private void openSetup() {
         startActivity(new Intent(this, SetupActivity.class));
+    }
+
+    private void askHttpAuth(HttpAuthHandler h, String host, String prefillUser) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = (int) (20 * getResources().getDisplayMetrics().density);
+        box.setPadding(pad, pad / 2, pad, 0);
+        EditText user = new EditText(this);
+        user.setHint(R.string.auth_user);
+        user.setText(prefillUser);
+        EditText pass = new EditText(this);
+        pass.setHint(R.string.auth_pass);
+        pass.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        box.addView(user);
+        box.addView(pass);
+        new AlertDialog.Builder(this)
+                .setTitle(getString(R.string.auth_title, host))
+                .setView(box)
+                .setCancelable(false)
+                .setPositiveButton(R.string.auth_ok, (d, w) -> {
+                    String u = user.getText().toString();
+                    String pw = pass.getText().toString();
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                            .putString(KEY_HTTP_USER, u).putString(KEY_HTTP_PASS, pw).apply();
+                    h.proceed(u, pw);
+                })
+                .setNegativeButton(R.string.auth_cancel, (d, w) -> h.cancel())
+                .show();
     }
 
     @Override

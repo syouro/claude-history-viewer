@@ -10,4 +10,9 @@
     <string name="error_title">连不上服务器</string>
     <string name="error_retry">重试</string>
     <string name="error_settings">改服务器地址</string>
+    <string name="auth_title">%s 需要访问密码</string>
+    <string name="auth_user">用户名</string>
+    <string name="auth_pass">密码</string>
+    <string name="auth_ok">确定</string>
+    <string name="auth_cancel">取消</string>
 </resources>

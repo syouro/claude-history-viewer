@@ -176,6 +176,7 @@ location /history/ {
 - **首次启动**填服务器地址（如 `https://你的域名/history/`），登录 cookie 持久化，之后打开即用。
 - **改地址**：长按返回键，或桌面长按 App 图标 →「服务器设置」。
 - **行为**：同域链接留在壳内，外链/下载交给系统浏览器；断网时显示重试页。
+- **反代 Basic Auth**：nginx 加了 `auth_basic` 也没关系——首次弹原生对话框输一次，之后记住自动带上。
 - **签名**：默认用 debug 签名（换签名的新版本要先卸载旧版）。想固定签名以便覆盖升级，
   在仓库 Settings → Secrets 配 `KEYSTORE_BASE64`（keystore 文件 base64）、
   `KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`：

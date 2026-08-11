@@ -135,6 +135,7 @@ location /history/ {
 - **First launch** asks for your server URL (e.g. `https://your.domain/history/`); the login cookie persists.
 - **Change the URL**: long-press the back button, or long-press the app icon → "服务器设置".
 - Same-host links stay in the shell; external links and downloads open in the system browser.
+- Reverse-proxy Basic Auth is supported: a native dialog asks once, then credentials are remembered.
 - **Signing**: defaults to a debug signature (uninstall before installing a differently-signed build). For stable upgrades, set the repo secrets `KEYSTORE_BASE64` (base64 of a keystore), `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
 
 The server itself stays zero-dependency; the shell is an independent subproject.
