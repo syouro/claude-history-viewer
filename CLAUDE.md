@@ -27,12 +27,29 @@
 - **多根扫描**：`roots` 可配多个；同名 项目/会话 在多根并存时**先配置的根优先**。
 - **排除**：`exclude` 按项目目录名做 glob（`*` `?`）匹配，命中的项目既不列出、API 也拒绝。
 
+## tmux 桥接（网页控制台）
+
+- 默认关闭；config.json `"tmux": true` 或 `TMUX_UI=1` 开启（不叫 TMUX：tmux 会注入同名变量）。
+- 思路是「翻译层」而非裸终端：`capture-pane` 抓屏 → `paneState()` 解析出交互状态
+  （`menu` 编号选项菜单 / `busy` 干活中 / `idle` 空闲 / `unknown`）→ 前端渲染成原生控件
+  （选项按钮、聊天输入框）→ UI 操作经 `send-keys` 翻译成按键注回 CLI。裸终端画面是兜底视图。
+- 路由：`GET /api/tmux`（窗格列表）、`GET /api/tmux/pane?t=%N[&lite=1]`（抓屏+状态）、
+  `POST /api/tmux/send`（注入；文本走 `-l` 字面量，具名键过 `TMUX_KEYS` 白名单）、
+  `POST /api/tmux/new`（新建会话：会话名过白名单、cwd 必须是已存在目录；启动命令会
+  包一层 `; exec $SHELL`，命令退出后落回 shell 而不是会话消失）、`POST /api/tmux/kill`（关窗格）。
+- 会话视图底部 `#composer` 控制条：按 cwd / 项目名匹配到 tmux 窗格才显示（优先 claude 进程）。
+- 解析的坑（都有测试兜着）：tmux 会把 `-F` 输出里的控制字符转成八进制字面量，
+  分隔符用可打印的 `␟`；选项块下方常有提示行/状态栏，不能要求菜单贴底；
+  输入提示符可能是 `>` 也可能是 `❯`；菜单必须「序号 1 起连续 + 有 ❯ 光标」才算，防误认正文列表。
+
 ## 安全（改动时务必保持）
 
 - 前端所有拼进 innerHTML 的动态文本都过 `esc()`/`hi()` 转义；新增渲染同样处理。
 - 后端 `project`/`id` 一律过 `NAME_RE`（`^[A-Za-z0-9._-]+$`）白名单，防路径穿越。
 - 密码与 token 用 `crypto.timingSafeEqual` 常数时间比较；登录限速 + 指数退避 + 固定延时。
 - 分享 token 带会话作用域（`sp`/`si`），`isAuthed` 拒绝它冒充登录会话。
+- tmux 桥接 = 远程命令执行：三条 `/api/tmux*` 路由都在 `if (!authed)` 之后（不接受分享 token）、
+  受 `TMUX_UI` 开关控制；pane 目标过 `PANE_RE`（`^%\d+$`），具名键过白名单，文本长度设上限。
 
 ## 缓存与索引（按需加载 + 惰性释放）
 

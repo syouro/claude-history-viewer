@@ -36,13 +36,32 @@ pm2 restart claude-history   # 改代码后
   "port": 48213,
   "host": "127.0.0.1",
   "cookiePath": "/history/",
-  "secureCookie": true
+  "secureCookie": true,
+  "tmux": true
 }
 ```
 
 - `roots` — 扫描根目录，可配多个；同名项目+会话在多个根中出现时，先配置的根优先
 - `exclude` — 例外规则：按项目目录名做 glob 匹配（支持 `*` `?`），命中的项目不列出、API 也拒绝访问
+- `tmux` — 开启 tmux 桥接（默认关闭，见下）
 - 配置文件路径可用 `CONFIG_PATH` 环境变量指定（默认 `./config.json`）
+
+## tmux 桥接（手机上远程操控 Claude Code）
+
+开启后（`"tmux": true` 或环境变量 `TMUX_UI=1`），登录用户可以：
+
+- **会话视图底部出现控制条**：当这段对话的 cwd 匹配到某个 tmux 窗格（优先 claude 进程）时，
+  可以直接给正在跑的 Claude Code 发消息；出现权限确认 / 选择菜单时，
+  自动解析成**原生按钮**，点一下即选择；忙碌时显示状态，Esc 一键打断。
+  配合已有的实时跟踪（live），在手机上就是一个完整的远程 Claude 客户端。
+- **▣ tmux 控制台**（侧栏图标）：列出所有 tmux 窗格，可打开任意窗格的裸终端画面
+  （带 ANSI 颜色，1.5s 轮询），下方同一条控制条可发文本和常用按键。
+- **网页新建 / 关闭会话**：控制台里可直接拉起新 tmux 会话——选目录（带历史会话目录联想）、
+  可选启动命令（填 `claude` 就直接开一个新的 Claude Code），建好即进画面；
+  窗格卡片上的 ✕ 可关闭窗格（二次确认）。启动命令退出后会落回 shell，不会把会话带没。
+
+安全：三条 `/api/tmux*` 路由仅登录会话可用（分享 token 不行），具名按键过白名单，
+默认关闭需显式开启。本质上等于给登录用户开了远程命令执行，请确保登录密码足够强、走 https。
 
 本地 http 调试（生产 cookie 限定在 `/history/` 且带 Secure，直连时要覆盖）：
 
@@ -64,6 +83,7 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 | `INDEX_PATH` | `./index.json` | 会话摘要索引文件路径 |
 | `INDEX_BLOBS_PATH` | `./index.blobs.json` | 搜索 blob 文件路径 |
 | `BLOB_TTL_MS` | `300000` | 搜索 blob 闲置多久后释放内存（毫秒） |
+| `TMUX_UI` | `0` | 开启 tmux 桥接（不叫 `TMUX`：tmux 会给子进程注入同名变量） |
 
 ## 索引
 

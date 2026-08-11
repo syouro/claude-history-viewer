@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 
 // ---------- 配置文件（config.json，环境变量优先）----------
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -41,6 +42,11 @@ const SECURE_COOKIE = process.env.SECURE_COOKIE !== undefined
   : USER_CFG.secureCookie !== undefined ? !!USER_CFG.secureCookie
   : true; // 默认带 Secure，公网 https
 const SESSION_TTL = 1000 * 60 * 60 * 24 * 7; // 会话 7 天
+// tmux 桥接（网页控制台，可向会话发送按键）：默认关闭，config.json {"tmux":true} 或 TMUX_UI=1 开启
+// （不用 TMUX 这个名字：tmux 自己会往子进程注入同名变量）
+const TMUX_UI = process.env.TMUX_UI !== undefined
+  ? !['0', 'false', 'no'].includes(String(process.env.TMUX_UI).toLowerCase())
+  : !!USER_CFG.tmux;
 
 // ---------- 配置 / 密钥（persist 到 secret.json）----------
 const CFG = path.join(__dirname, 'secret.json');
@@ -645,6 +651,92 @@ function toMarkdown(s) {
   return L.join('\n');
 }
 
+// ---------- tmux 桥接（网页控制台）----------
+// 思路：不裸搬终端，而是加一层「翻译」——后端 capture-pane 抓屏并解析出 Claude Code 的
+// 交互状态（空闲输入框 / 编号选项菜单 / 忙碌中），前端渲染成原生控件；用户的 UI 操作再由
+// send-keys 翻译成按键注回 CLI。裸终端画面只作兜底视图。
+const PANE_RE = /^%\d+$/; // 只接受 tmux pane id（如 %3），防注入 / 选项注入
+// send-keys 允许的具名按键白名单（文本走 -l 字面量通道，不查这个表）
+const TMUX_KEYS = new Set(['Enter', 'Escape', 'Tab', 'BTab', 'Up', 'Down', 'Left', 'Right',
+  'BSpace', 'DC', 'Home', 'End', 'PPage', 'NPage', 'C-c', 'C-u', 'C-d', 'C-l', 'C-r']);
+function tmux(args) {
+  return new Promise((resolve, reject) => {
+    execFile('tmux', args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => (err ? reject(err) : resolve(stdout)));
+  });
+}
+const PANE_FMT = ['#{pane_id}', '#{session_name}', '#{window_index}', '#{window_name}',
+  '#{pane_index}', '#{pane_current_command}', '#{pane_current_path}',
+  '#{pane_active}', '#{pane_width}', '#{pane_height}'].join('\u241f'); // ␟：可打印的罕见分隔符（tmux 会把真控制字符转成八进制字面量输出，不能用真正的 US）
+async function tmuxPanes() {
+  let out = '';
+  try { out = await tmux(['list-panes', '-a', '-F', PANE_FMT]); }
+  catch { return []; } // tmux 未装或无服务 → 空列表
+  return out.split('\n').filter(Boolean).map((l) => {
+    const [id, session, win, winName, paneIdx, cmd, cwd, active, w, h] = l.split('\u241f');
+    return { id, session, win: +win, winName, paneIdx: +paneIdx, cmd, cwd,
+      active: active === '1', w: +w, h: +h,
+      claude: /^(claude|node|bun)$/.test(cmd) }; // claude CLI 的进程名可能是 node/bun
+  });
+}
+// 去掉 ANSI 转义（SGR / 光标控制 / OSC 标题等），留纯文本供状态解析
+function stripAnsi(s) {
+  return String(s)
+    .replace(/\u001b\][^\u0007\u001b]*(\u0007|\u001b\\)?/g, '')
+    .replace(/\u001b\[[0-9;?:]*[A-Za-z]/g, '')
+    .replace(/\u001b[()][0-9A-B]/g, '');
+}
+// 从终端画面猜 Claude Code 的交互状态：
+//   menu — 编号选项菜单（权限确认 / AskUserQuestion / 各类选择器）：question + options
+//   busy — 正在干活（esc 可打断）
+//   idle — 空闲，输入框等待输入
+//   unknown — 识别不了（非 Claude 界面等），前端只给裸终端
+function paneState(raw) {
+  // 去转义后再剥掉对话框的竖线边框，便于按行匹配
+  const lines = stripAnsi(raw).split('\n').map((l) =>
+    l.replace(/^\s*[│┃]\s?/, '').replace(/\s*[│┃]\s*$/, '').replace(/\s+$/, ''));
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const tail = lines.slice(-45);
+  const busy = /esc to interrupt/i.test(tail.join('\n'));
+  // 状态栏里的权限模式（manual mode / accept edits / plan mode…），供前端显示在 ⇧⇥ 按钮上
+  let mode = '';
+  for (let k = tail.length - 1; k >= Math.max(0, tail.length - 6); k--) {
+    const m = tail[k].match(
+      /(manual mode|auto-accept|accept edits|plan mode|bypass(?:ing)? permissions|auto mode)/i);
+    if (m) { mode = m[1].toLowerCase(); break; }
+  }
+  // 找可见区里最后一个连续的「❯ 1. xxx / 2. xxx」编号选项块。
+  // 不能要求贴着底部：块下方常有提示行（Esc to cancel · Tab to amend…）/ 状态栏。
+  const OPT_RE = /^\s*(❯\s*)?(\d+)[.)]\s+(.+)$/;
+  let end = -1;
+  for (let k = tail.length - 1; k >= 0; k--) {
+    if (OPT_RE.test(tail[k])) { end = k; break; }
+  }
+  if (end >= 0) {
+    let start = end;
+    while (start > 0 && OPT_RE.test(tail[start - 1])) start--;
+    const opts = tail.slice(start, end + 1).map((l) => {
+      const m = l.match(OPT_RE);
+      return { n: +m[2], label: m[3].trim(), sel: !!m[1] };
+    });
+    // 序号必须从 1 连续递增、且带 ❯ 光标，才认为是菜单（避免把正文里的有序列表当菜单）
+    if (opts.length >= 2 && opts.every((o, k) => o.n === k + 1) && opts.some((o) => o.sel)) {
+      let question = '';
+      for (let k = start - 1; k >= 0; k--) { // 往上找最近的非空行当问题（跳过边框线）
+        const t = tail[k].trim();
+        if (!t || /^[─╌╭╮╰╯]+$/.test(t)) continue;
+        question = t; break;
+      }
+      return { kind: 'menu', question, options: opts, mode };
+    }
+  }
+  if (busy) return { kind: 'busy', mode };
+  for (let k = tail.length - 1; k >= Math.max(0, tail.length - 8); k--) {
+    if (/^[>❯]$/.test(tail[k]) || /^[>❯]\s/.test(tail[k])) return { kind: 'idle', mode }; // 底部的输入提示符
+  }
+  return { kind: 'unknown', mode };
+}
+
 // ---------- HTTP ----------
 function sendJSON(res, obj, code = 200) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -857,6 +949,83 @@ const server = http.createServer(async (req, res) => {
       const inc = url.searchParams.get('thinking') === '1';
       sendJSON(res, search(url.searchParams.get('q') || '', inc)); return;
     }
+    // ---- tmux 桥接（仅登录可用，不接受分享 token；默认关闭需显式开启）----
+    if (p === '/api/tmux') { // 窗格列表；未开启时回 enabled:false，前端据此隐藏入口
+      if (!TMUX_UI) { sendJSON(res, { enabled: false, panes: [] }); return; }
+      sendJSON(res, { enabled: true, panes: await tmuxPanes() }); return;
+    }
+    if (p === '/api/tmux/pane') { // 抓屏 + 状态解析；lite=1 只回状态（会话控制条轮询用）
+      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      const t = url.searchParams.get('t') || '';
+      if (!PANE_RE.test(t)) { sendJSON(res, { error: 'bad target' }, 400); return; }
+      let lines = +(url.searchParams.get('lines') || 200);
+      if (!Number.isFinite(lines)) lines = 200;
+      lines = Math.max(50, Math.min(2000, lines));
+      try {
+        const text = await tmux(['capture-pane', '-p', '-e', '-t', t, '-S', '-' + lines]);
+        const state = paneState(text);
+        sendJSON(res, url.searchParams.get('lite') === '1' ? { state } : { text, state });
+      } catch (e) {
+        sendJSON(res, { error: '抓取失败：' + String(e.message || e).split('\n')[0] }, 404);
+      }
+      return;
+    }
+    if (p === '/api/tmux/send' && req.method === 'POST') { // 注入按键：文本走字面量，具名键过白名单
+      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      const t = String(body.t || '');
+      const text = typeof body.text === 'string' ? body.text : '';
+      const keys = Array.isArray(body.keys) ? body.keys.map(String) : [];
+      if (!PANE_RE.test(t) || text.length > 10000 || keys.length > 8 ||
+          keys.some((k) => !TMUX_KEYS.has(k)) || (!text && !keys.length)) {
+        sendJSON(res, { error: 'bad request' }, 400); return;
+      }
+      try {
+        if (text) await tmux(['send-keys', '-t', t, '-l', '--', text]);
+        for (const k of keys) await tmux(['send-keys', '-t', t, k]);
+        sendJSON(res, { ok: true });
+      } catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
+      return;
+    }
+    if (p === '/api/tmux/new' && req.method === 'POST') { // 新建会话：默认开 shell，可指定目录和启动命令
+      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      const name = String(body.name || '').trim();
+      const cmd = String(body.cmd || '').trim();
+      let cwd = String(body.cwd || '').trim();
+      // 会话名不带 . :（tmux target 里是分隔符）、不以 - 开头（防选项注入）
+      if (name && !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,49}$/.test(name)) {
+        sendJSON(res, { error: '会话名只能用字母数字下划线连字符，且不能以 - 开头' }, 400); return;
+      }
+      if (cmd.length > 500) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      if (cwd) {
+        cwd = path.resolve(expandHome(cwd));
+        try { if (!fs.statSync(cwd).isDirectory()) throw new Error('not dir'); }
+        catch { sendJSON(res, { error: '目录不存在：' + cwd }, 400); return; }
+      }
+      const args = ['new-session', '-d', '-P', '-F', '#{pane_id}'];
+      if (name) args.push('-s', name);
+      if (cwd) args.push('-c', cwd);
+      // 命令退出后落回 shell 而不是整个会话消失（出门在外拉不起第二次就尴尬了）
+      if (cmd) args.push('--', cmd + ' ; exec "${SHELL:-/bin/bash}"');
+      try {
+        const paneId = (await tmux(args)).trim();
+        sendJSON(res, { ok: true, pane: (await tmuxPanes()).find((x) => x.id === paneId) || null });
+      } catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
+      return;
+    }
+    if (p === '/api/tmux/kill' && req.method === 'POST') { // 关闭窗格（会话的最后一个窗格没了，会话随之结束）
+      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      const t = String(body.t || '');
+      if (!PANE_RE.test(t)) { sendJSON(res, { error: 'bad target' }, 400); return; }
+      try { await tmux(['kill-pane', '-t', t]); sendJSON(res, { ok: true }); }
+      catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
+      return;
+    }
     sendJSON(res, { error: 'not found' }, 404);
   } catch (e) {
     sendJSON(res, { error: e.message }, 500);
@@ -869,6 +1038,7 @@ module.exports = {
   priceFor, costOf, parseSession, searchBlobs, indexEntry,
   refreshIndex, listAll, search, loadSession, deleteSession, summary, INDEX,
   saveIndex, saveBlobs, // 供测试强制落盘（生产走 3s 防抖）
+  stripAnsi, paneState, // tmux 桥接的纯函数
 };
 
 if (require.main === module) {
@@ -877,6 +1047,7 @@ if (require.main === module) {
     console.log(`Claude 历史查看器：http://${HOST}:${PORT}`);
     console.log('  扫描根目录：' + ROOTS.join('，'));
     if (EXCLUDE.length) console.log('  排除规则：' + (USER_CFG.exclude || []).join('，'));
+    console.log('  tmux 桥接：' + (TMUX_UI ? '已开启（网页可向 tmux 会话发送按键）' : '未开启'));
     if (generated) {
       console.log('\n  ⚠ 已生成随机登录密码（也写入 secret.json）：');
       console.log('      ' + generated + '\n');
@@ -1140,6 +1311,58 @@ mark.cur{outline:2px solid var(--accent);border-radius:3px}
 .tblwrap{overflow-x:auto;border-radius:12px}
 details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 .msg.agent .who{color:#7c6bd6}
+/* tmux 控制条（会话视图底部）与控制台 */
+#composer{display:none;border-top:1px solid var(--line);background:var(--panel);padding:8px 14px 6px}
+#composer.show{display:block}
+.crow{display:flex;gap:6px;align-items:flex-end;max-width:860px;margin:0 auto}
+#cin{flex:1;min-width:0;resize:none;padding:8px 11px;border:1px solid var(--line);border-radius:10px;
+  background:var(--field);color:var(--ink);font-size:13px;outline:none;max-height:120px}
+#cin:focus{border-color:var(--accent)}
+#csend{border:0;background:var(--accent);color:#fff;border-radius:10px;width:40px;height:36px;
+  font-size:14px;cursor:pointer;flex:none}
+.ckey,#cterm{border:1px solid var(--line);background:var(--field);color:var(--muted);border-radius:9px;
+  height:36px;min-width:34px;padding:0 8px;font-size:12px;cursor:pointer;flex:none}
+.ckey:hover,#cterm:hover{border-color:var(--accent);color:var(--ink)}
+#cstate{max-width:860px;margin:0 auto 6px}
+#cstate:empty{display:none}
+.cq{font-size:12.5px;color:var(--muted);margin:2px 0 6px}
+.copts{display:flex;flex-wrap:wrap;gap:6px}
+.copt{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
+  padding:6px 12px;font-size:12.5px;cursor:pointer;text-align:left}
+.copt:hover{border-color:var(--accent)}
+.copt.sel{border-color:var(--accent);background:var(--accent-soft)}
+.copt b{color:var(--accent);margin-right:6px}
+.copt:disabled{opacity:.5;cursor:default}
+.cbusy{font-size:12.5px;color:var(--muted)}
+.ctarget{max-width:860px;margin:4px auto 0;font-size:10.5px;color:var(--muted);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.termwrap{max-width:1100px;margin:0 auto}
+.termbar{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12.5px;
+  color:var(--muted);flex-wrap:wrap}
+.termbar button{border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  border-radius:8px;padding:5px 11px;font-size:12px;cursor:pointer}
+.termbar button:hover{border-color:var(--accent)}
+.tnew{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.tnew input{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:8px;
+  padding:6px 9px;font-size:12px;min-width:0;outline:none}
+.tnew input:focus{border-color:var(--accent)}
+#tname{width:120px}#tcwd{flex:2;min-width:150px}#tcmd{flex:1.2;min-width:150px}
+#tcreate{white-space:nowrap}
+#tcreate:disabled{opacity:.6}
+.pane-card{position:relative;padding-right:38px}
+.pkill{position:absolute;top:9px;right:9px;border:1px solid var(--line);background:var(--field);
+  color:var(--muted);border-radius:7px;width:24px;height:24px;cursor:pointer;font-size:11px}
+.pkill:hover{border-color:#d64545;color:#d64545}
+.termscr{background:#14161b;border:1px solid var(--line);border-radius:12px;padding:10px 12px;
+  overflow:auto;max-height:calc(100vh - 230px);-webkit-overflow-scrolling:touch}
+.termscr pre{margin:0;font:12px/1.42 ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:#cfd3dc;white-space:pre}
+@media (max-width:720px){
+  #composer{padding:6px 8px 4px}
+  .ckey[data-k=Up],.ckey[data-k=Down]{display:none} /* 手机上省位置，↑↓ 少用 */
+  .termscr{max-height:calc(100vh - 260px)}
+  .termscr pre{font-size:11px}
+}
 </style></head><body>
 
 <div id="login">
@@ -1160,6 +1383,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     <div class="hrow">
       <h1><span class="dot"></span>Claude 对话历史</h1>
       <div class="icons">
+        <button class="iconbtn" id="termBtn" title="tmux 控制台" style="display:none">▣</button>
         <button class="iconbtn" id="statsBtn" title="用量统计">📊</button>
         <button class="iconbtn" id="theme" title="切换深浅色">◐</button>
         <button class="iconbtn" id="logout" title="退出登录">⏻</button>
@@ -1196,6 +1420,19 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     <button id="hitPrev" title="上一处">↑</button><button id="hitNext" title="下一处">↓</button></div>
   <div id="conv"><div class="empty">← 选择左侧的一段对话开始查看<br><br>
     在搜索框输入关键词可跨全部会话搜正文</div></div>
+  <div id="composer">
+    <div id="cstate"></div>
+    <div class="crow">
+      <button class="ckey" data-k="Escape" title="Esc：打断 / 取消">Esc</button>
+      <button class="ckey" data-k="BTab" title="Shift+Tab：切换权限模式">⇧⇥</button>
+      <button class="ckey" data-k="Up" title="↑">↑</button>
+      <button class="ckey" data-k="Down" title="↓">↓</button>
+      <textarea id="cin" rows="1" placeholder="发给这个会话…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="csend" title="发送并回车">➤</button>
+      <button id="cterm" title="打开终端画面">▣</button>
+    </div>
+    <div class="ctarget" id="ctarget"></div>
+  </div>
 </main>
 
 <script src="app.js?v=__APPVER__"></script></body></html>`;
