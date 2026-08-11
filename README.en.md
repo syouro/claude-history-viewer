@@ -30,6 +30,7 @@ pm2 restart claude-history   # after code changes
 - **Filters** — project dropdown, time range (today / 7 / 30 / 90 days / 6 months / 1 year / custom start–end dates), and an “include thinking” toggle for search
 - **Paged loading** — a session opens with its latest 80 messages, viewed from the bottom; scrolling up loads earlier messages on demand
 - **Live tracking** — sessions written to within 2 minutes get a pulsing “in progress” badge; an open session polls for new messages and appends them incrementally, auto-following when you are at the bottom
+- **tmux bridge** (optional, off by default) — remote-control a running Claude Code from your phone. The backend captures the terminal and parses it into an interaction state; the frontend renders native controls: send a message, tap to answer a permission/choice prompt, <kbd>Esc</kbd> to interrupt, <kbd>⇧⇥</kbd> to cycle permission modes (the button shows the current mode). A ▣ console lists panes, shows a raw ANSI terminal as a fallback, and can create / kill sessions from the web. See the dedicated section below
 - **Subagent sidechains** — `<sessionId>/subagents/agent-*.jsonl` files are parsed separately; chips above the conversation switch between the main thread and each subagent
 - **Compaction awareness** — `summary` lines, `isCompactSummary` messages, and `compact_boundary` markers render as a summary banner, a collapsible block, and a divider respectively
 - **Tool-aware rendering** — Bash shows the command, Read/Write/Edit show file paths, Edit renders a red/green diff, todo lists / questions / subagent calls get structured cards; unknown tools fall back to JSON
@@ -54,13 +55,25 @@ All settings live in `config.json` (every key optional); environment variables a
   "port": 48213,
   "host": "127.0.0.1",
   "cookiePath": "/history/",
-  "secureCookie": true
+  "secureCookie": true,
+  "tmux": true
 }
 ```
 
 - `roots` — one or more directories to scan; when the same project+session exists in several roots, the first root wins
 - `exclude` — glob patterns (`*` `?`) matched against project directory names; excluded projects are hidden from the list *and* rejected by the API
+- `tmux` — enable the tmux bridge (off by default; see below)
 - Use `CONFIG_PATH` to point at a different config file (default `./config.json`)
+
+## tmux bridge (remote-control Claude Code from your phone)
+
+Once enabled (`"tmux": true`, or the `TMUX_UI=1` env var), a logged-in user can:
+
+- **Composer bar at the bottom of a session view** — when the session's cwd matches a tmux pane (a `claude` process is preferred), you can message the running Claude Code directly. Permission / choice prompts are parsed into **native buttons** — one tap to answer. A busy state is shown, with <kbd>Esc</kbd> to interrupt and <kbd>⇧⇥</kbd> to cycle permission modes (the button shows the current mode). Combined with live tracking, this is a full remote Claude client in the browser.
+- **▣ tmux console** (sidebar icon) — list every tmux pane and open any pane's raw terminal (ANSI colors, polled every 1.5 s). The same composer bar sends text and common keys.
+- **Create / kill sessions from the web** — spin up a new tmux session (pick a directory with autocomplete from your history, optionally a startup command — type `claude` to launch a fresh Claude Code); a pane card's ✕ kills it (with confirmation). A startup command falls back to a shell on exit, so the session isn't lost.
+
+Security: the three `/api/tmux*` routes are login-only (share tokens rejected), named keys go through a whitelist, and the whole feature is off unless explicitly enabled. It effectively grants remote command execution to logged-in users, so use a strong password and serve over https.
 
 Local http debugging (production cookies are `Secure` and path-scoped):
 
@@ -79,6 +92,7 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 | `VIEWER_PASSWORD` | — | Overrides the password stored in `secret.json` |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Overrides `roots` entirely (single directory) |
 | `CONFIG_PATH` | `./config.json` | Config file location |
+| `TMUX_UI` | `0` | Enable the tmux bridge (not `TMUX`: tmux injects that name into child processes) |
 
 ## Files
 
@@ -110,3 +124,7 @@ location /history/ {
     proxy_set_header   X-Forwarded-Proto $scheme;
 }
 ```
+
+## License
+
+[MIT](LICENSE) © syouro
