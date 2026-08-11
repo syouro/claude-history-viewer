@@ -8,3 +8,10 @@ index.blobs.json
 nginx.conf.bak
 *.log
 node_modules/
+
+# Android 壳子构建产物
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.keystore

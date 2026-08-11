@@ -67,6 +67,16 @@
 - `deleteSession()`：`fs.unlinkSync` 删 `.jsonl` + `fs.rmSync` 删 `<id>/subagents` 目录，并清 cache/INDEX/BLOBS/FAVS。
 - **不可恢复**。`POST /api/delete` 仅登录可用（`if (!authed)` 之后），**不接受分享 token**；前端二次 `confirm`。
 
+## Android 壳子（`android/`）
+
+- 极简 WebView 壳，**独立子项目**：纯 Android SDK + Java，不引第三方库；
+  零依赖约束只管 `server.js`/`app.js`，与壳子互不影响。
+- 本机没有 Android SDK，**构建只在 GitHub Actions 上做**（`.github/workflows/android.yml`）：
+  打 `v*` tag 自动出 APK 挂 Release，或手动 Run workflow 取 artifact。
+- 服务器地址存 SharedPreferences，首次启动进 `SetupActivity` 填写；
+  长按返回键 / 桌面长按图标快捷方式可再改。壳内拦截 `app://settings`、`app://reload`。
+- 签名：secrets 配了 `KEYSTORE_BASE64` 等四项就用固定签名，否则退回 debug 签名。
+
 ## 运行 / 调试
 
 ```bash

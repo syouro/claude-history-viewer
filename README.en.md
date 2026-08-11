@@ -101,6 +101,8 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 - `config.json` — service config (scan roots, exclusions, port, …)
 - `secret.json` — HMAC secret & password (auto-generated, never commit)
 - `favorites.json` — favorites & notes (auto-generated, never commit)
+- `android/` — Android shell app (WebView, see below)
+- `.github/workflows/android.yml` — GitHub Actions workflow that builds the APK on tag push
 
 ## Security
 
@@ -124,6 +126,18 @@ location /history/ {
     proxy_set_header   X-Forwarded-Proto $scheme;
 }
 ```
+
+## Android shell app
+
+`android/` contains a minimal WebView shell (pure Android SDK, no third-party deps) that wraps the viewer as a phone app:
+
+- **Get the APK**: push a tag (`git tag v1.0 && git push --tags`) and GitHub Actions builds it and attaches it to the Release; or trigger the workflow manually and grab the artifact.
+- **First launch** asks for your server URL (e.g. `https://your.domain/history/`); the login cookie persists.
+- **Change the URL**: long-press the back button, or long-press the app icon → "服务器设置".
+- Same-host links stay in the shell; external links and downloads open in the system browser.
+- **Signing**: defaults to a debug signature (uninstall before installing a differently-signed build). For stable upgrades, set the repo secrets `KEYSTORE_BASE64` (base64 of a keystore), `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
+
+The server itself stays zero-dependency; the shell is an independent subproject.
 
 ## License
 

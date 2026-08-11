@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+// CI 里配了 KEYSTORE_FILE 就用正式签名，否则退回 debug 签名（照样可安装，
+// 但换签名后升级需先卸载旧版）
+def ksFile = System.getenv('KEYSTORE_FILE')
+
+android {
+    namespace 'io.github.syouro.claudehistory'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'io.github.syouro.claudehistory'
+        minSdk 26
+        targetSdk 34
+        versionCode Integer.parseInt(System.getenv('VERSION_CODE') ?: '1')
+        versionName(System.getenv('VERSION_NAME') ?: '1.0-dev')
+    }
+
+    signingConfigs {
+        release {
+            if (ksFile) {
+                storeFile file(ksFile)
+                storePassword System.getenv('KEYSTORE_PASSWORD')
+                keyAlias System.getenv('KEY_ALIAS')
+                keyPassword System.getenv('KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig ksFile ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}

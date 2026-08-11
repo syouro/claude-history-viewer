@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Claude 历史</string>
+    <string name="setup_title">服务器地址</string>
+    <string name="setup_desc">填历史查看器的完整地址（之后长按返回键、或桌面长按图标可再改）</string>
+    <string name="url_hint">https://example.com/history/</string>
+    <string name="url_error">要以 http:// 或 https:// 开头</string>
+    <string name="save">保存并打开</string>
+    <string name="shortcut_settings">服务器设置</string>
+    <string name="error_title">连不上服务器</string>
+    <string name="error_retry">重试</string>
+    <string name="error_settings">改服务器地址</string>
+</resources>

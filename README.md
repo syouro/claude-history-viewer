@@ -118,6 +118,8 @@ node --test        # test/ 下的 node:test 用例，零依赖
 - `favorites.json` — 收藏与备注（自动生成，勿入库）
 - `index.json` — 会话摘要索引（自动生成、可安全删除重建，勿入库）
 - `index.blobs.json` — 搜索用正文/思考 blob（惰性读盘、闲置释放，勿入库）
+- `android/` — Android 壳子 App（WebView，见下方专节）
+- `.github/workflows/android.yml` — 打 tag 自动出 APK 的 GitHub Actions
 
 ## 功能
 
@@ -164,6 +166,26 @@ location /history/ {
 ```
 
 改动前的配置已备份为 `nginx.conf.bak`。
+
+## Android 壳子 App
+
+`android/` 下是一个极简 WebView 壳子（纯 Android SDK，无第三方依赖），把查看器包成手机 App：
+
+- **拿 APK**：打 tag（`git tag v1.0 && git push --tags`）后 GitHub Actions 自动构建并挂到
+  Release；也可在 Actions 页手动 Run workflow，从 artifact 下载。
+- **首次启动**填服务器地址（如 `https://你的域名/history/`），登录 cookie 持久化，之后打开即用。
+- **改地址**：长按返回键，或桌面长按 App 图标 →「服务器设置」。
+- **行为**：同域链接留在壳内，外链/下载交给系统浏览器；断网时显示重试页。
+- **签名**：默认用 debug 签名（换签名的新版本要先卸载旧版）。想固定签名以便覆盖升级，
+  在仓库 Settings → Secrets 配 `KEYSTORE_BASE64`（keystore 文件 base64）、
+  `KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`：
+
+  ```bash
+  keytool -genkeypair -keystore release.keystore -alias viewer -keyalg RSA -validity 9999
+  base64 -w0 release.keystore   # 结果填进 KEYSTORE_BASE64
+  ```
+
+服务本体照旧零依赖；壳子是独立子项目，不影响 `server.js`/`app.js`。
 
 ## 许可证
 
