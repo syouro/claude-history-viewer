@@ -297,6 +297,7 @@ async function open(s, jumpIdx) {
   view = { offset: data.offset, total: data.total, terms: full ? lastTerms : [],
     mode: 'main', loading: false, wrap: null, older: null };
   $('#top').style.display = 'flex'; $('#ttl').textContent = data.title;
+  $('#top').classList.remove('open'); $('#more').classList.remove('on'); // 换会话时收起操作栏
   var bits = [projName(data.project), '<span id="mcount">' + data.msgCount + ' 条消息</span>',
     data.usage && data.usage.cost ? ('≈ ' + fmtUSD(data.usage.cost)) : '',
     data.agentName ? ('⚙ ' + esc(data.agentName)) : '',
@@ -1293,6 +1294,10 @@ document.querySelectorAll('#composer .ckey').forEach(function (b) {
 $('#cterm').onclick = function () { // 从会话控制条跳到裸终端画面
   var pn = (TMUX.panes || []).filter(function (x) { return x.id === COMP.target; })[0];
   if (pn) openPane(pn);
+};
+$('#more').onclick = function () { // 手机上展开/收起 收藏·分享·导出·删除
+  var on = $('#top').classList.toggle('open');
+  $('#more').classList.toggle('on', on);
 };
 $('#menuBtn').onclick = function () { document.body.classList.toggle('nav-open'); };
 $('#scrim').onclick = function () { document.body.classList.remove('nav-open'); };

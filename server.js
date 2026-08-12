@@ -1165,6 +1165,9 @@ mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}
 #top h2{margin:0;font-size:16px}
 #top .sub{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:14px;flex-wrap:wrap}
 .tbtns{display:flex;gap:8px;align-items:flex-start}
+#more{display:none;border:1px solid var(--line);background:var(--field);color:var(--muted);
+  border-radius:9px;width:34px;height:30px;font-size:15px;line-height:1;cursor:pointer;flex:none}
+#more.on{border-color:var(--accent);color:var(--accent)}
 #exp,#fav,#share,#del{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:9px;
   padding:7px 12px;font-size:12.5px;cursor:pointer;white-space:nowrap}
 #exp:hover,#fav:hover,#share:hover{border-color:var(--accent)}
@@ -1253,9 +1256,14 @@ details.tool summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     transform:translateX(-105%);transition:transform .22s ease;box-shadow:4px 0 24px rgba(0,0,0,.18)}
   body.nav-open #side{transform:none}
   #side header{padding-top:14px}
-  #top{padding:12px 14px 12px 58px;flex-wrap:wrap}
-  #top h2{font-size:14.5px}
-  .tbtns{width:100%;justify-content:flex-end}
+  #top{padding:9px 14px 9px 58px;flex-wrap:wrap;align-items:center}
+  #top h2{font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* 手机上默认只留标题一行：路径/花销小字和操作按钮都收进 ⋯ */
+  #more{display:block}
+  #top .sub{display:none}
+  #top.open .sub{display:flex}
+  .tbtns{display:none;width:100%;justify-content:flex-end}
+  #top.open .tbtns{display:flex}
   #chains{padding:8px 14px}
   #conv{padding:14px 10px 70px}
   .msg{gap:6px}
@@ -1329,6 +1337,8 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 #composer{display:none;border-top:1px solid var(--line);background:var(--panel);padding:8px 14px 6px}
 #composer.show{display:block}
 .crow{display:flex;gap:6px;align-items:flex-end;max-width:860px;margin:0 auto}
+.crow.ckeys{margin-top:6px;align-items:center;flex-wrap:wrap}
+.ckeys #cterm{margin-left:auto}
 #cin{flex:1;min-width:0;resize:none;padding:8px 11px;border:1px solid var(--line);border-radius:10px;
   background:var(--field);color:var(--ink);font-size:13px;outline:none;max-height:120px}
 #cin:focus{border-color:var(--accent)}
@@ -1373,7 +1383,6 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   color:#cfd3dc;white-space:pre}
 @media (max-width:720px){
   #composer{padding:6px 8px 4px}
-  .ckey[data-k=Up],.ckey[data-k=Down]{display:none} /* 手机上省位置，↑↓ 少用 */
   .termscr{max-height:calc(100vh - 260px)}
   .termscr pre{font-size:11px}
 }
@@ -1425,6 +1434,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 <main id="main" style="display:none;position:relative">
   <div id="top"><div style="min-width:0;flex:1"><h2 id="ttl"></h2><div class="sub" id="sub"></div>
       <input id="favnote" placeholder="收藏备注，回车保存" style="display:none"></div>
+    <button id="more" title="更多操作">⋯</button>
     <div class="tbtns"><button id="fav" title="收藏">☆</button>
       <button id="share" title="生成 7 天有效的只读分享链接">分享</button>
       <button id="exp">导出 MD</button>
@@ -1437,12 +1447,15 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   <div id="composer">
     <div id="cstate"></div>
     <div class="crow">
+      <textarea id="cin" rows="1" placeholder="发给这个会话…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="csend" title="发送并回车">➤</button>
+    </div>
+    <div class="crow ckeys">
       <button class="ckey" data-k="Escape" title="Esc：打断 / 取消">Esc</button>
       <button class="ckey" data-k="BTab" title="Shift+Tab：切换权限模式">⇧⇥</button>
       <button class="ckey" data-k="Up" title="↑">↑</button>
       <button class="ckey" data-k="Down" title="↓">↓</button>
-      <textarea id="cin" rows="1" placeholder="发给这个会话…（Enter 发送，Shift+Enter 换行）"></textarea>
-      <button id="csend" title="发送并回车">➤</button>
+      <button class="ckey" data-k="Enter" title="回车确认">⏎</button>
       <button id="cterm" title="打开终端画面">▣</button>
     </div>
     <div class="ctarget" id="ctarget"></div>
