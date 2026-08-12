@@ -1043,6 +1043,11 @@ async function sendTmux(payload) {
     if (!j.ok) { alert('发送失败：' + (j.error || r.status)); return; }
     COMP.sig = ''; // 状态马上会变，强制下轮重绘
     if (COMP.mode === 'session') schedCState(600);
+    else if (COMP.mode === 'pane') { // 发过键立刻回快档，马上看到反应
+      paneIdle = 0; clearTimeout(paneTimer);
+      var pt = COMP.target;
+      paneTimer = setTimeout(function () { pollPane(pt); }, 300);
+    }
   } catch (e) { alert('发送失败：' + e); }
 }
 // 会话视图：cwd 或项目名匹配到 tmux 窗格才显示控制条（优先 claude 进程的窗格）
@@ -1128,11 +1133,50 @@ function openPane(pn) {
   $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
   $('#conv').innerHTML = '<div class="termwrap"><div class="termbar">' +
     '<button id="tback">← 窗格列表</button><b>' + esc(paneLabel(pn)) + '</b><span>' +
-    esc(pn.cmd) + '</span><span class="mono">' + esc(pn.cwd) + '</span></div>' +
+    esc(pn.cmd) + '</span><span class="mono">' + esc(pn.cwd) + '</span>' +
+    '<button id="tfit" title="把 tmux 窗口调成当前屏幕放得下的列数，TUI 会自己重排">适配屏宽</button></div>' +
     '<div class="termscr" id="termscr"><pre id="termpre"></pre></div></div>';
   $('#tback').onclick = openTermList;
+  $('#tfit').onclick = function () { fitPane(pn.id, false); };
+  // 窄屏自动收窄 tmux 窗口，免得横着划；桌面不动（本地可能还 attach 着别的终端）
+  if (window.matchMedia('(max-width:720px)').matches) {
+    var cols = fitCols();
+    if (cols && Math.abs(pn.w - cols) > 2) fitPane(pn.id, true);
+  }
   showComposer(pn, 'pane'); // 状态由 pollPane 顺带喂给控制条，不再单独轮询
+  paneIdle = 0; paneLast = '';
   pollPane(pn.id);
+}
+// 量出等宽字符实际宽度，算 termscr 能放下的列数
+function fitCols() {
+  var scr = $('#termscr'), pre = $('#termpre');
+  if (!scr || !pre) return 0;
+  var probe = document.createElement('span');
+  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre';
+  probe.textContent = new Array(51).join('0'); // 50 个字符取均值，避免亚像素误差
+  pre.appendChild(probe);
+  var cw = probe.getBoundingClientRect().width / 50;
+  probe.remove();
+  if (!cw) return 0;
+  var pad = 24; // .termscr 左右 padding 12px×2
+  return Math.max(20, Math.min(500, Math.floor((scr.clientWidth - pad) / cw)));
+}
+async function fitPane(t, quiet) {
+  var cols = fitCols();
+  if (!cols) return;
+  try {
+    var r = await fetch('api/tmux/resize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ t: t, x: cols })
+    });
+    var j = await r.json().catch(function () { return {}; });
+    if (!j.ok && !quiet) alert('调宽失败：' + (j.error || r.status));
+  } catch (e) { if (!quiet) alert('调宽失败：' + e); }
+}
+// 自适应节流：画面在变 1.5s 一抓；连着没变化就逐步退到 6s，一有动静（或发过键）立刻回快档
+var paneIdle = 0, paneLast = '';
+function paneDelay() {
+  return [1500, 1500, 3000, 4500, 6000][Math.min(paneIdle, 4)];
 }
 async function pollPane(t) {
   if (view.mode !== 'pane' || COMP.target !== t) return;
@@ -1141,14 +1185,17 @@ async function pollPane(t) {
     var j = await (await fetch('api/tmux/pane?lines=300&t=' + encodeURIComponent(t))).json();
     if (view.mode !== 'pane' || COMP.target !== t) return;
     if (!j.error) {
-      var scr = $('#termscr');
-      var follow = scr.scrollHeight - scr.scrollTop - scr.clientHeight < 90;
-      $('#termpre').innerHTML = ansiToHtml(j.text);
-      if (follow) scr.scrollTop = scr.scrollHeight;
+      if (j.text !== paneLast) {
+        paneLast = j.text; paneIdle = 0;
+        var scr = $('#termscr');
+        var follow = scr.scrollHeight - scr.scrollTop - scr.clientHeight < 90;
+        $('#termpre').innerHTML = ansiToHtml(j.text);
+        if (follow) scr.scrollTop = scr.scrollHeight;
+      } else paneIdle++;
       updateCState(j.state);
     }
   } catch (e) { /* 网络抖动 */ }
-  paneTimer = setTimeout(function () { pollPane(t); }, 1500);
+  paneTimer = setTimeout(function () { pollPane(t); }, paneDelay());
 }
 
 // ---------- 事件 ----------

@@ -36,7 +36,9 @@
 - 路由：`GET /api/tmux`（窗格列表）、`GET /api/tmux/pane?t=%N[&lite=1]`（抓屏+状态）、
   `POST /api/tmux/send`（注入；文本走 `-l` 字面量，具名键过 `TMUX_KEYS` 白名单）、
   `POST /api/tmux/new`（新建会话：会话名过白名单、cwd 必须是已存在目录；启动命令会
-  包一层 `; exec $SHELL`，命令退出后落回 shell 而不是会话消失）、`POST /api/tmux/kill`（关窗格）。
+  包一层 `; exec $SHELL`，命令退出后落回 shell 而不是会话消失）、`POST /api/tmux/kill`（关窗格）、
+  `POST /api/tmux/resize`（`resize-window -x` 调窗口列宽；手机开裸终端时前端自动按屏宽收窄，
+  桌面不自动动、有「适配屏宽」按钮手动触发；本地终端想恢复自适应用 `resize-window -A`）。
 - 会话视图底部 `#composer` 控制条：按 cwd / 项目名匹配到 tmux 窗格才显示（优先 claude 进程）。
 - 解析的坑（都有测试兜着）：tmux 会把 `-F` 输出里的控制字符转成八进制字面量，
   分隔符用可打印的 `␟`；选项块下方常有提示行/状态栏，不能要求菜单贴底；
@@ -48,7 +50,7 @@
 - 后端 `project`/`id` 一律过 `NAME_RE`（`^[A-Za-z0-9._-]+$`）白名单，防路径穿越。
 - 密码与 token 用 `crypto.timingSafeEqual` 常数时间比较；登录限速 + 指数退避 + 固定延时。
 - 分享 token 带会话作用域（`sp`/`si`），`isAuthed` 拒绝它冒充登录会话。
-- tmux 桥接 = 远程命令执行：三条 `/api/tmux*` 路由都在 `if (!authed)` 之后（不接受分享 token）、
+- tmux 桥接 = 远程命令执行：所有 `/api/tmux*` 路由都在 `if (!authed)` 之后（不接受分享 token）、
   受 `TMUX_UI` 开关控制；pane 目标过 `PANE_RE`（`^%\d+$`），具名键过白名单，文本长度设上限。
 
 ## 缓存与索引（按需加载 + 惰性释放）

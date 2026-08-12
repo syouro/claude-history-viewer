@@ -1026,6 +1026,20 @@ const server = http.createServer(async (req, res) => {
       catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
       return;
     }
+    if (p === '/api/tmux/resize' && req.method === 'POST') { // 调窗口列宽：手机上让 TUI 按屏宽重排
+      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      let body = {};
+      try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+      const t = String(body.t || '');
+      const x = Math.round(+body.x);
+      if (!PANE_RE.test(t) || !Number.isFinite(x) || x < 20 || x > 500) {
+        sendJSON(res, { error: 'bad request' }, 400); return;
+      }
+      // resize-window 会把窗口设成手动尺寸；本地终端再 attach 想恢复自适应：resize-window -A
+      try { await tmux(['resize-window', '-t', t, '-x', String(x)]); sendJSON(res, { ok: true }); }
+      catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
+      return;
+    }
     sendJSON(res, { error: 'not found' }, 404);
   } catch (e) {
     sendJSON(res, { error: e.message }, 500);
