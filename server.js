@@ -228,7 +228,7 @@ function parseSession(project, id, filePath) {
   const sidechains = new Map();   // agentId -> 子代理侧链
   const summaries = [];           // 压缩续接产生的历史摘要
   let title = '', firstPrompt = '', cwd = '', gitBranch = '', agentName = '';
-  let firstTs = null, lastTs = null;
+  let firstTs = null, lastTs = null, lastModel = '';
   // token 用量统计（含子代理）
   const usage = { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 };
   // usageByDay：日期 -> 模型 -> 用量（按天+按模型的汇总都从这里推，支持任意时间区间）
@@ -268,7 +268,10 @@ function parseSession(project, id, filePath) {
     if (ts) { if (!firstTs) firstTs = ts; lastTs = ts; }
     if (o.cwd) cwd = o.cwd;
     if (o.gitBranch) gitBranch = o.gitBranch;
-    if (role === 'assistant') addUsage(msg, ts);
+    if (role === 'assistant') {
+      addUsage(msg, ts);
+      if (msg.model && msg.model !== '<synthetic>') lastModel = msg.model;
+    }
     const m = { role, ts, isMeta, blocks };
     if (o.isCompactSummary) m.compact = true;
     if (o.isSidechain) {
@@ -320,7 +323,7 @@ function parseSession(project, id, filePath) {
     String(a.firstTs || '').localeCompare(String(b.firstTs || '')));
   return {
     project, id, src: 'claude', title: title || firstPrompt || '(无标题)', firstPrompt,
-    cwd, gitBranch, agentName, mtime: stat.mtimeMs, firstTs, lastTs,
+    cwd, gitBranch, agentName, mtime: stat.mtimeMs, firstTs, lastTs, lastModel,
     msgCount: messages.length, summaries,
     usage, usageByDay, msgsByDay,
     sidechains: chains, messages,
@@ -510,7 +513,7 @@ function parseCodexSession(id, filePath) {
     project: codexProject(cwd), id, src: 'codex', threadSource,
     title: title || firstPrompt || '(无标题)', firstPrompt,
     cwd, gitBranch, agentName: '', mtime: stat.mtimeMs, firstTs, lastTs,
-    msgCount: messages.length, summaries: [],
+    lastModel: model, msgCount: messages.length, summaries: [],
     usage, usageByDay, msgsByDay,
     sidechains: [], messages,
   };
@@ -640,7 +643,7 @@ const INDEX = new Map(); // key -> { stamp, summary }
 (function loadIndex() {
   try {
     const raw = JSON.parse(fs.readFileSync(INDEX_PATH, 'utf8'));
-    if (raw && raw.version === 2 && raw.entries)
+    if (raw && raw.version === 3 && raw.entries)
       for (const [k, v] of Object.entries(raw.entries)) INDEX.set(k, v);
   } catch { /* 无索引或旧版本 → 首次请求时重建 */ }
 })();
@@ -652,7 +655,7 @@ function scheduleSave() {
 }
 function saveIndex() {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-  writeJsonAtomic(INDEX_PATH, { version: 2, entries: Object.fromEntries(INDEX) });
+  writeJsonAtomic(INDEX_PATH, { version: 3, entries: Object.fromEntries(INDEX) });
 }
 function writeJsonAtomic(fp, obj) {
   try {
@@ -814,7 +817,8 @@ function summary(s) {
     project: s.project, id: s.id, src: s.src || 'claude',
     title: s.title, firstPrompt: s.firstPrompt,
     cwd: s.cwd, gitBranch: s.gitBranch, agentName: s.agentName, mtime: s.mtime,
-    firstTs: s.firstTs, lastTs: s.lastTs, msgCount: s.msgCount,
+    firstTs: s.firstTs, lastTs: s.lastTs, lastModel: s.lastModel || '',
+    msgCount: s.msgCount,
     sidechainCount: s.sidechains.length, hasSummary: s.summaries.length > 0,
     usage: s.usage, usageByDay: s.usageByDay, msgsByDay: s.msgsByDay,
   };
@@ -1539,6 +1543,7 @@ details.tool summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .tbtns{display:none;width:100%;justify-content:flex-end}
   #top.open .tbtns{display:flex}
   #chains{padding:8px 14px}
+  #udetail{padding:8px 14px 10px}
   #conv{padding:14px 10px 70px}
   .msg{gap:6px}
   .who{min-width:40px;font-size:9.5px;padding-top:10px}
@@ -1546,6 +1551,12 @@ details.tool summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #hitbar{right:12px;top:8px}
   .stats .tiles{grid-template-columns:repeat(2,1fr)}
 }
+/* 会话用量明细（点顶栏用量小字展开） */
+#udetail{display:none;padding:10px 22px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+#udetail.show{display:block}
+#top .sub .uchip{cursor:pointer}
+#top .sub .uchip:hover{color:var(--ink)}
+.mbadge{background:var(--accent-soft);color:var(--accent);padding:0 7px;border-radius:7px;font-weight:600}
 /* 子代理侧链切换 */
 #chains{display:none;gap:6px;padding:8px 22px;border-bottom:1px solid var(--line);
   background:var(--panel);flex-wrap:wrap;align-items:center}
@@ -1714,6 +1725,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <button id="share" title="生成 7 天有效的只读分享链接">分享</button>
       <button id="exp">导出 MD</button>
       <button id="del" title="删除对话文件（不可恢复）">删除</button></div></div>
+  <div id="udetail"></div>
   <div id="chains"></div>
   <div id="hitbar"><span id="hitn"></span>
     <button id="hitPrev" title="上一处">↑</button><button id="hitNext" title="下一处">↓</button></div>
@@ -1730,6 +1742,8 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <button class="ckey" data-k="BTab" title="Shift+Tab：切换权限模式">⇧⇥</button>
       <button class="ckey" data-k="Up" title="↑">↑</button>
       <button class="ckey" data-k="Down" title="↓">↓</button>
+      <button class="ckey" data-k="Left" title="←">←</button>
+      <button class="ckey" data-k="Right" title="→">→</button>
       <button class="ckey" data-k="Enter" title="回车确认">⏎</button>
       <button id="cterm" title="打开终端画面">▣</button>
     </div>

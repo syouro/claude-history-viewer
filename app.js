@@ -238,8 +238,25 @@ function emptyMsg(list, t) {
   var e = document.createElement('div'); e.className = 'empty';
   e.style.marginTop = '40px'; e.textContent = t; list.appendChild(e);
 }
+function shortModel(m) { // 省地方：去掉 claude- 前缀与 -20250929 式日期后缀
+  return (m || '').replace(/^claude-/, '').replace(/-\d{8}$/, '');
+}
+function sessionModels(s) { // usageByDay 里出现过的模型，按输出量降序
+  var agg = {};
+  Object.keys(s.usageByDay || {}).forEach(function (d) {
+    var by = s.usageByDay[d];
+    Object.keys(by).forEach(function (m) {
+      if (m === '(unknown)') return;
+      agg[m] = (agg[m] || 0) + (by[m].out || 0);
+    });
+  });
+  return Object.keys(agg).sort(function (a, b) { return agg[b] - agg[a]; });
+}
 function extras(s) {
   var out = '';
+  var m = s.lastModel || sessionModels(s)[0];
+  if (m) out += '<span>' + esc(shortModel(m)) + '</span>';
+  if (s.usage && s.usage.cost >= 0.005) out += '<span>' + fmtUSD(s.usage.cost) + '</span>';
   if (s.agentName) out += '<span>⚙ ' + esc(s.agentName) + '</span>';
   if (s.sidechainCount) out += '<span>🤖 ' + s.sidechainCount + ' 子代理</span>';
   if (s.hasSummary) out += '<span>📦 续接</span>';
@@ -305,13 +322,23 @@ async function open(s, jumpIdx) {
     mode: 'main', loading: false, wrap: null, older: null };
   $('#top').style.display = 'flex'; $('#ttl').textContent = data.title;
   $('#top').classList.remove('open'); $('#more').classList.remove('on'); // 换会话时收起操作栏
+  var models = sessionModels(data);
+  var mainModel = shortModel(data.lastModel || models[0] || '');
+  var u = data.usage || {};
   var bits = [projName(data.project), '<span id="mcount">' + data.msgCount + ' 条消息</span>',
-    data.usage && data.usage.cost ? ('≈ ' + fmtUSD(data.usage.cost)) : '',
+    mainModel ? ('<span class="mbadge" title="' + esc(models.map(shortModel).join(' / ') || mainModel) +
+      '">' + esc(mainModel) + (models.length > 1 ? ' +' + (models.length - 1) : '') + '</span>') : '',
+    (u.in || u.out) ? ('<span class="uchip" id="uchip" title="点击展开按模型的用量明细">↑' +
+      fmtTok(u.out) + ' ↓' + fmtTok(u.in) +
+      (u.cost ? ' · ≈' + fmtUSD(u.cost) : '') + '</span>') : '',
     data.agentName ? ('⚙ ' + esc(data.agentName)) : '',
     data.gitBranch ? ('⎇ ' + data.gitBranch) : '',
     data.cwd ? ('<span class="mono">' + esc(data.cwd) + '</span>') : '',
     data.firstTs ? new Date(data.firstTs).toLocaleString('zh-CN') : ''].filter(Boolean);
   $('#sub').innerHTML = bits.map(function (b) { return '<span>' + b + '</span>'; }).join('');
+  hideUdetail(); // 换会话时收起用量明细
+  var uc = $('#uchip');
+  if (uc) uc.onclick = function () { toggleUdetail(data); };
   $('#exp').onclick = function () {
     var a = document.createElement('a');
     a.href = 'api/export?project=' + encodeURIComponent(data.project) +
@@ -399,7 +426,7 @@ async function delSession(s) {
   delete favs[favKey(s)];
   if (current && favKey(current) === favKey(s)) {   // 关掉正在看的这段
     current = null; clearTimeout(liveTimer); hideComposer();
-    $('#top').style.display = 'none'; $('#chains').style.display = 'none';
+    $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail();
     $('#conv').innerHTML = '<div class="empty">对话已删除</div>';
     history.replaceState(null, '', location.pathname + location.search);
   }
@@ -826,6 +853,29 @@ function usageRow(name, u, extra) {
     '</td><td>' + fmtUSD(u.cost) + '</td></tr>';
 }
 var USAGE_TH = '<th>消息</th><th>输出</th><th>输入</th><th>缓存写</th><th>缓存读</th><th>花费（估算）</th>';
+// 顶栏用量小字 → 展开/收起本会话按模型的用量明细
+function hideUdetail() {
+  $('#udetail').classList.remove('show'); $('#udetail').innerHTML = '';
+}
+function toggleUdetail(data) {
+  var el = $('#udetail');
+  if (el.classList.contains('show')) { hideUdetail(); return; }
+  var by = {}; // usageByDay（日期→模型→用量）压成 模型→用量
+  Object.keys(data.usageByDay || {}).forEach(function (d) {
+    Object.keys(data.usageByDay[d]).forEach(function (m) {
+      var t = by[m] = by[m] || { in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 };
+      var u = data.usageByDay[d][m];
+      t.in += u.in || 0; t.out += u.out || 0; t.cw += u.cw || 0; t.cr += u.cr || 0;
+      t.msgs += u.msgs || 0; t.cost += u.cost || 0;
+    });
+  });
+  var rows = Object.keys(by).sort(function (a, b) { return by[b].out - by[a].out; })
+    .map(function (m) { return usageRow(shortModel(m) || m, by[m]); }).join('');
+  if (!rows) return;
+  el.innerHTML = '<div class="tblwrap"><table class="stbl">' +
+    '<tr><th>模型</th>' + USAGE_TH + '</tr>' + rows + '</table></div>';
+  el.classList.add('show');
+}
 // 统计区间（UTC 日期，与后端按 timestamp 切出来的天对齐）
 var statsRange = { preset: '30', from: '', to: '' };
 function dayStr(d) { return new Date(d).toISOString().slice(0, 10); }
@@ -878,7 +928,7 @@ async function openStats() {
   var st = await (await fetch('api/stats?' + qs.join('&'))).json();
   current = null; view.mode = 'stats'; clearTimeout(liveTimer);
   stopPane(); hideComposer();
-  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail(); hideHits();
   // 「全部」用库里数据的真实边界当区间；空库退化成今天
   var today = dayStr(Date.now());
   var cFrom = r.from || st.range.minDay || today;
@@ -1152,7 +1202,7 @@ function stopPane() { clearTimeout(paneTimer); paneTimer = null; }
 async function openTermList() {
   current = null; view.mode = 'term'; clearTimeout(liveTimer);
   stopPane(); hideComposer();
-  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail(); hideHits();
   await loadTmux();
   if (view.mode !== 'term') return;
   var panes = TMUX.panes || [];
@@ -1215,7 +1265,7 @@ async function openTermList() {
 }
 function openPane(pn) {
   current = null; view.mode = 'pane'; clearTimeout(liveTimer); stopPane();
-  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail(); hideHits();
   $('#conv').innerHTML = '<div class="termwrap"><div class="termbar">' +
     '<button id="tback">← 窗格列表</button><b>' + esc(paneLabel(pn)) + '</b><span>' +
     esc(pn.cmd) + '</span><span class="mono">' + esc(pn.cwd) + '</span>' +
@@ -1298,7 +1348,7 @@ function switchSrc(s) {
   // 两页独立：关掉当前会话视图，回到本源的列表
   current = null; clearTimeout(liveTimer); stopPane(); hideComposer();
   view.mode = 'idle';
-  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail(); hideHits();
   $('#conv').innerHTML = '<div class="empty">← 选择左侧的一段对话开始查看</div>';
   history.replaceState(null, '', location.pathname + location.search);
   fillProjects(); $('#fproj').value = '';

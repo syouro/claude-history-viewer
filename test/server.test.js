@@ -148,7 +148,7 @@ test('blobs.json 落盘且不进 index.json（摘要与 blob 分离）', () => {
   S.search('alpaca', false);                               // 触发 blob 载入
   S.saveIndex(); S.saveBlobs();                             // 强制落盘（跳过 3s 防抖）
   const idx = JSON.parse(fs.readFileSync(process.env.INDEX_PATH, 'utf8'));
-  assert.equal(idx.version, 2);
+  assert.equal(idx.version, 3);
   const anyEntry = Object.values(idx.entries)[0];
   assert.ok(anyEntry.summary && anyEntry.stamp);
   assert.ok(!('text' in anyEntry) && !('think' in anyEntry)); // 摘要索引不含 blob
