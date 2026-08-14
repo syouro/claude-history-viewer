@@ -1204,6 +1204,9 @@ async function sendTmux(payload) {
     if (COMP.mode === 'session') schedCState(600);
     else if (COMP.mode === 'pane') { // 发过键立刻回快档，马上看到反应
       paneIdle = 0; clearTimeout(paneTimer);
+      paneHold = 0; panePend = ''; // 发了命令就是想看结果：解除冻结、跳回底部
+      var scr = $('#termscr');
+      if (scr) { scr.scrollTop = scr.scrollHeight; $('#tresume').style.display = 'none'; }
       var pt = COMP.target;
       paneTimer = setTimeout(function () { pollPane(pt); }, 300);
     }

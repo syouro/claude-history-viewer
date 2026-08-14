@@ -1355,7 +1355,7 @@ if (require.main === module) {
 
 // ---------- 前端（内嵌单页）----------
 const HTML = /* html */ `<!doctype html><html lang="zh"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <title>Claude 对话历史</title>
 <style>
 :root{
@@ -1667,7 +1667,8 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   color:var(--muted);border-radius:7px;width:24px;height:24px;cursor:pointer;font-size:11px}
 .pkill:hover{border-color:#d64545;color:#d64545}
 .termscr{background:#14161b;border:1px solid var(--line);border-radius:12px;padding:10px 12px;
-  overflow:auto;max-height:calc(100vh - 230px);-webkit-overflow-scrolling:touch}
+  overflow:auto;max-height:calc(100vh - 230px);max-height:calc(100dvh - 230px);
+  -webkit-overflow-scrolling:touch}
 .termscr pre{margin:0;font:12px/1.42 ui-monospace,SFMono-Regular,Menlo,monospace;
   color:#cfd3dc;white-space:pre}
 /* 终端网格对齐：全角/制表线的字宽修正量由前端 termCellCSS() 实测后写进 --lsw/--lsb */
@@ -1676,7 +1677,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 @media (max-width:720px){
   #composer{padding:6px 8px 4px}
   .termbar{padding-left:48px} /* 让出左上角 ☰ 汉堡键 */
-  .termscr{max-height:calc(100vh - 260px)}
+  .termscr{max-height:calc(100vh - 260px);max-height:calc(100dvh - 260px)}
   .termscr pre{font-size:11px}
 }
 </style></head><body>
