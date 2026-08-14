@@ -1099,7 +1099,8 @@ function ansiToHtml(s) {
   var flush = function (txt) {
     if (!txt) return;
     var sty = sgrStyle(st);
-    out += sty ? '<span style="' + sty + '">' + esc(txt) + '</span>' : esc(txt);
+    var body = cellAlign(esc(txt));
+    out += sty ? '<span style="' + sty + '">' + body + '</span>' : body;
   };
   while ((m = re.exec(s))) {
     flush(s.slice(last, m.index));
@@ -1108,6 +1109,29 @@ function ansiToHtml(s) {
   }
   flush(s.slice(last));
   return out;
+}
+// 终端网格对齐：浏览器字体里 CJK ≠ 2×拉丁宽、制表线也可能不是 1 格，TUI 边框会错位。
+// 全角字符强制 2 格、制表线强制 1 格：修正量由 termCellCSS() 实测字宽后写进 CSS 变量。
+var TERM_WIDE_RE = /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹏！-｠￠-￦]+/g;
+var TERM_BOX_RE = /[─-╿]+/g;
+function cellAlign(escaped) {
+  return escaped
+    .replace(TERM_WIDE_RE, '<span class="tw">$&</span>')
+    .replace(TERM_BOX_RE, '<span class="tb">$&</span>');
+}
+function termCellCSS() {
+  var pre = $('#termpre');
+  if (!pre) return;
+  var mk = function (t) {
+    var p = document.createElement('span');
+    p.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;letter-spacing:0';
+    p.textContent = t; pre.appendChild(p);
+    var w = p.getBoundingClientRect().width; p.remove(); return w;
+  };
+  var cw = mk(new Array(51).join('0')) / 50;
+  if (!cw) return;
+  pre.style.setProperty('--lsw', (2 * cw - mk(new Array(11).join('中')) / 10).toFixed(3) + 'px');
+  pre.style.setProperty('--lsb', (cw - mk(new Array(11).join('─')) / 10).toFixed(3) + 'px');
 }
 
 // ---- 控制条（会话视图与终端视图共用底部 #composer）----
@@ -1270,17 +1294,40 @@ function openPane(pn) {
     '<button id="tback">← 窗格列表</button><b>' + esc(paneLabel(pn)) + '</b><span>' +
     esc(pn.cmd) + '</span><span class="mono">' + esc(pn.cwd) + '</span>' +
     '<button id="tfit" title="把 tmux 窗口调成当前屏幕放得下的列数，TUI 会自己重排">适配屏宽</button></div>' +
-    '<div class="termscr" id="termscr"><pre id="termpre"></pre></div></div>';
+    '<div class="termscr" id="termscr"><pre id="termpre"></pre></div>' +
+    '<button id="tresume" style="display:none">⏸ 已暂停刷新 · 回到底部</button></div>';
   $('#tback').onclick = openTermList;
   $('#tfit').onclick = function () { fitPane(pn.id, false); };
+  termCellCSS();
+  // 滑动查看历史时冻结刷新（新画面攒在 panePend），否则每 1.5s 重建 DOM 会掐断手势、
+  // 而且抓屏窗口在滚动，内容会在手底下跳
+  var scr = $('#termscr');
+  var holdOn = function () { paneHold = Date.now() + 60e3; };   // 手指按住：一直冻结
+  var holdOff = function () { paneHold = Date.now() + 800; };   // 松手：再留 800ms 给惯性滚动
+  scr.addEventListener('touchstart', holdOn, { passive: true });
+  scr.addEventListener('touchend', holdOff);
+  scr.addEventListener('touchcancel', holdOff);
+  scr.addEventListener('wheel', holdOff, { passive: true });
+  scr.addEventListener('scroll', function () { // 手动滑回底部即恢复刷新
+    if (panePend && paneGap(scr) < 20) paneApply();
+  });
+  $('#tresume').onclick = paneApply;
   // 窄屏自动收窄 tmux 窗口，免得横着划；桌面不动（本地可能还 attach 着别的终端）
   if (window.matchMedia('(max-width:720px)').matches) {
     var cols = fitCols();
     if (cols && Math.abs(pn.w - cols) > 2) fitPane(pn.id, true);
   }
   showComposer(pn, 'pane'); // 状态由 pollPane 顺带喂给控制条，不再单独轮询
-  paneIdle = 0; paneLast = '';
+  paneIdle = 0; paneLast = ''; paneHold = 0; panePend = '';
   pollPane(pn.id);
+}
+function paneGap(scr) { return scr.scrollHeight - scr.scrollTop - scr.clientHeight; }
+function paneApply() { // 把攒着的最新画面刷出来并回到底部
+  var scr = $('#termscr');
+  if (!scr) return;
+  if (panePend) { $('#termpre').innerHTML = ansiToHtml(panePend); panePend = ''; }
+  scr.scrollTop = scr.scrollHeight;
+  $('#tresume').style.display = 'none';
 }
 // 量出等宽字符实际宽度，算 termscr 能放下的列数
 function fitCols() {
@@ -1309,7 +1356,7 @@ async function fitPane(t, quiet) {
   } catch (e) { if (!quiet) alert('调宽失败：' + e); }
 }
 // 自适应节流：画面在变 1.5s 一抓；连着没变化就逐步退到 6s，一有动静（或发过键）立刻回快档
-var paneIdle = 0, paneLast = '';
+var paneIdle = 0, paneLast = '', paneHold = 0, panePend = '';
 function paneDelay() {
   return [1500, 1500, 3000, 4500, 6000][Math.min(paneIdle, 4)];
 }
@@ -1323,10 +1370,17 @@ async function pollPane(t) {
       if (j.text !== paneLast) {
         paneLast = j.text; paneIdle = 0;
         var scr = $('#termscr');
-        var follow = scr.scrollHeight - scr.scrollTop - scr.clientHeight < 90;
-        $('#termpre').innerHTML = ansiToHtml(j.text);
-        if (follow) scr.scrollTop = scr.scrollHeight;
+        if (Date.now() < paneHold || paneGap(scr) >= 90) { // 冻结中：攒着，亮出恢复浮标
+          panePend = j.text;
+          $('#tresume').style.display = '';
+        } else {
+          $('#termpre').innerHTML = ansiToHtml(j.text);
+          panePend = '';
+          scr.scrollTop = scr.scrollHeight;
+        }
       } else paneIdle++;
+      // 画面没变但人已经回到底部：把冻结期攒下的刷出来
+      if (panePend && Date.now() >= paneHold && paneGap($('#termscr')) < 90) paneApply();
       updateCState(j.state);
     }
   } catch (e) { /* 网络抖动 */ }

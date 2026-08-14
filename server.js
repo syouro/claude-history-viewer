@@ -1645,7 +1645,11 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 .cbusy{font-size:12.5px;color:var(--muted)}
 .ctarget{max-width:860px;margin:4px auto 0;font-size:10.5px;color:var(--muted);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.termwrap{max-width:1100px;margin:0 auto}
+.termwrap{max-width:1100px;margin:0 auto;position:relative}
+#tresume{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);z-index:5;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:999px;
+  padding:6px 14px;font-size:12px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+#tresume:hover{border-color:var(--accent)}
 .termbar{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12.5px;
   color:var(--muted);flex-wrap:wrap}
 .termbar button{border:1px solid var(--line);background:var(--panel);color:var(--ink);
@@ -1666,8 +1670,12 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   overflow:auto;max-height:calc(100vh - 230px);-webkit-overflow-scrolling:touch}
 .termscr pre{margin:0;font:12px/1.42 ui-monospace,SFMono-Regular,Menlo,monospace;
   color:#cfd3dc;white-space:pre}
+/* 终端网格对齐：全角/制表线的字宽修正量由前端 termCellCSS() 实测后写进 --lsw/--lsb */
+.termscr pre .tw{letter-spacing:var(--lsw,0px)}
+.termscr pre .tb{letter-spacing:var(--lsb,0px)}
 @media (max-width:720px){
   #composer{padding:6px 8px 4px}
+  .termbar{padding-left:48px} /* 让出左上角 ☰ 汉堡键 */
   .termscr{max-height:calc(100vh - 260px)}
   .termscr pre{font-size:11px}
 }
