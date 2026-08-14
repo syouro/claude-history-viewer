@@ -1255,6 +1255,9 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         if (text) await tmux(['send-keys', '-t', t, '-l', '--', text]);
+        // codex 等 TUI 按「按键到达间隔」识别粘贴：文本后紧跟的 Enter 会被当成粘贴里的
+        // 换行而不提交。隔一拍再发具名键，让 TUI 先把文本当粘贴收完
+        if (text && keys.length) await new Promise((r) => setTimeout(r, 150));
         for (const k of keys) await tmux(['send-keys', '-t', t, k]);
         sendJSON(res, { ok: true });
       } catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
