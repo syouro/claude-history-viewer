@@ -37,13 +37,17 @@ pm2 restart claude-history   # 改代码后
   "host": "127.0.0.1",
   "cookiePath": "/history/",
   "secureCookie": true,
-  "tmux": true
+  "tmux": true,
+  "codexRoots": ["~/.codex/sessions"],
+  "codex": true
 }
 ```
 
 - `roots` — 扫描根目录，可配多个；同名项目+会话在多个根中出现时，先配置的根优先
 - `exclude` — 例外规则：按项目目录名做 glob 匹配（支持 `*` `?`），命中的项目不列出、API 也拒绝访问
 - `tmux` — 开启 tmux 桥接（默认关闭，见下）
+- `codexRoots` — codex 会话根目录（`sessions/YYYY/MM/DD/rollout-*.jsonl`），可配多个，默认 `~/.codex/sessions`
+- `codex` — 显式开 / 关 codex 页（缺省时目录存在即启用）
 - 配置文件路径可用 `CONFIG_PATH` 环境变量指定（默认 `./config.json`）
 
 ## tmux 桥接（手机上远程操控 Claude Code）
@@ -84,6 +88,7 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 | `INDEX_BLOBS_PATH` | `./index.blobs.json` | 搜索 blob 文件路径 |
 | `BLOB_TTL_MS` | `300000` | 搜索 blob 闲置多久后释放内存（毫秒） |
 | `TMUX_UI` | `0` | 开启 tmux 桥接（不叫 `TMUX`：tmux 会给子进程注入同名变量） |
+| `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | 整体覆盖 `codexRoots`（只支持单个目录） |
 
 ## 索引
 
@@ -129,6 +134,7 @@ node --test        # test/ 下的 node:test 用例，零依赖
 - **分页加载**：打开会话默认只取最近 80 条，从底部看起，上滚自动加载更早的
 - **实时跟踪**：2 分钟内有写入的会话标「● 进行中」；打开后自动轮询增量追加新消息，在底部时跟随滚动
 - **tmux 桥接**（可选，默认关闭）：手机上远程操控正在跑的 Claude Code——后端抓终端画面并解析成交互状态，前端渲染成原生控件：发消息、权限确认一键点选、<kbd>Esc</kbd> 打断、<kbd>⇧⇥</kbd> 切权限模式（按钮实时显示当前档位）；▣ 控制台可列窗格、看 ANSI 裸终端兜底、网页新建 / 关闭会话。详见下方专节
+- **Codex 页**：侧栏顶部 Claude / Codex 两个独立页签，也能浏览 codex CLI 的会话历史（`~/.codex/sessions`）——列表、搜索、统计、收藏、分享、导出、删除全套一致；exec_command / apply_patch（红绿补丁）/ update_plan 等工具调用做了友好渲染，思考摘要折叠展示，token 用量按模型统计；codex 内部子代理线程（审批评估等）不进列表
 - **子代理侧链**：`<sessionId>/subagents/agent-*.jsonl` 单独解析，顶部 chips 切换主对话 / 各子代理
 - **压缩续接**：`summary` 行、`isCompactSummary` 消息、`compact_boundary` 边界分别渲染为摘要横幅 / 折叠块 / 分隔线
 - **工具调用友好渲染**：Bash 显示命令、Read/Write/Edit 显示路径、Edit 渲染红绿 diff、待办清单 / 提问 / 子代理卡片；未知工具回退 JSON

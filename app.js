@@ -2,7 +2,12 @@
 var $ = function (s) { return document.querySelector(s); };
 var sessions = [], current = null, searchMode = false, lastTerms = [], favs = {};
 var SHARE = new URLSearchParams(location.search).get('share'); // 访客只读模式
-function favKey(s) { return s.project + '/' + s.id; }
+// 数据源：claude / codex 两页独立（列表、搜索、统计互不混）。收藏键与后端 keyOf 对齐
+var SRC = localStorage.getItem('chv-src') === 'codex' ? 'codex' : 'claude';
+var CODEX_ON = false;
+function bySrc(arr) { return arr.filter(function (s) { return (s.src || 'claude') === SRC; }); }
+function aiName(src) { return src === 'codex' ? 'Codex' : 'Claude'; }
+function favKey(s) { return s.src === 'codex' ? 'codex:' + s.id : s.project + '/' + s.id; }
 function shareQ() { return SHARE ? '&share=' + encodeURIComponent(SHARE) : ''; }
 var PAGE = 80; // 每次加载的消息条数
 
@@ -188,7 +193,7 @@ function applyFilters(arr) {
 }
 function fillProjects() {
   var sel = $('#fproj'), cur = sel.value, ps = {};
-  sessions.forEach(function (s) { ps[s.project] = 1; });
+  bySrc(sessions).forEach(function (s) { ps[s.project] = 1; });
   sel.innerHTML = '<option value="">全部项目</option>' +
     Object.keys(ps).sort().map(function (p) {
       return '<option value="' + esc(p) + '">' + esc(projName(p)) + '</option>';
@@ -204,7 +209,7 @@ async function loadList() {
 }
 function render(filter) {
   var list = $('#list'); list.innerHTML = '';
-  var items = applyFilters(sessions);
+  var items = applyFilters(bySrc(sessions));
   if (filter) items = items.filter(function (s) {
     return fuzzy(s.title + ' ' + (s.firstPrompt || '') + ' ' + s.project, filter);
   });
@@ -261,7 +266,7 @@ function searchItemEl(s) {
   if (s.hits) html += '<div class="r"><span class="badge">' + s.hits +
     ' 处命中</span><span>' + rel(s.lastTs) + '</span>' + extras(s) + '</div>';
   if (s.snippet) html += '<div class="snip"><b>' + (s.snippet.kind === 'thinking' ? '💭 ' : '') +
-    (s.snippet.role === 'user' ? '你' : s.snippet.role === 'agent' ? '子代理' : 'Claude') +
+    (s.snippet.role === 'user' ? '你' : s.snippet.role === 'agent' ? '子代理' : aiName(s.src)) +
     '：</b>' + hi(s.snippet.text, lastTerms) + '</div>';
   el.innerHTML = html;
   el.onclick = function () { open(s); };
@@ -269,7 +274,8 @@ function searchItemEl(s) {
 }
 async function doSearch(q) {
   var inc = $('#fthink').checked ? '&thinking=1' : '';
-  var res = await (await fetch('api/search?q=' + encodeURIComponent(q) + inc)).json();
+  var res = await (await fetch('api/search?q=' + encodeURIComponent(q) + inc +
+    '&src=' + SRC)).json();
   lastTerms = q.toLowerCase().split(/\s+/).filter(Boolean);
   res = applyFilters(res);
   var list = $('#list'); list.innerHTML = '';
@@ -284,7 +290,8 @@ var view = { offset: 0, total: 0, terms: [], mode: 'main', loading: false, wrap:
 
 function apiSession(s, params) {
   return fetch('api/session?project=' + encodeURIComponent(s.project) +
-    '&id=' + encodeURIComponent(s.id) + shareQ() + (params || ''))
+    '&id=' + encodeURIComponent(s.id) + '&src=' + (s.src || 'claude') +
+    shareQ() + (params || ''))
     .then(function (r) { return r.json(); });
 }
 async function open(s, jumpIdx) {
@@ -308,7 +315,7 @@ async function open(s, jumpIdx) {
   $('#exp').onclick = function () {
     var a = document.createElement('a');
     a.href = 'api/export?project=' + encodeURIComponent(data.project) +
-      '&id=' + encodeURIComponent(data.id) + shareQ();
+      '&id=' + encodeURIComponent(data.id) + '&src=' + (data.src || 'claude') + shareQ();
     a.download = ''; document.body.appendChild(a); a.click(); a.remove();
   };
   $('#del').onclick = function () { delSession(data); };
@@ -323,7 +330,8 @@ async function open(s, jumpIdx) {
   bindComposer(data);
   document.body.classList.remove('nav-open'); // 移动端选完会话收起抽屉
   if (jumpIdx != null) jumpToMsg(jumpIdx);
-  history.replaceState(null, '', '#s=' + encodeURIComponent(data.project) + '/' +
+  history.replaceState(null, '', '#s=' + (data.src === 'codex' ? 'codex:' : '') +
+    encodeURIComponent(data.project) + '/' +
     encodeURIComponent(data.id) + (jumpIdx != null ? '/' + jumpIdx : ''));
   scheduleLive();
   if (searchMode) doSearch($('#q').value.trim()); else render($('#q').value.trim());
@@ -335,12 +343,13 @@ function jumpToMsg(idx) {
   el.classList.add('flash');
   setTimeout(function () { el.classList.remove('flash'); }, 2000);
 }
-// #s=项目/会话ID[/消息序号] 直达定位
+// #s=[codex:]项目/会话ID[/消息序号] 直达定位
 function navFromHash() {
-  var m = location.hash.match(/^#s=([^/]+)\/([^/]+)(?:\/(\d+))?$/);
+  var m = location.hash.match(/^#s=(codex:)?([^/]+)\/([^/]+)(?:\/(\d+))?$/);
   if (!m) return;
-  var s = { project: decodeURIComponent(m[1]), id: decodeURIComponent(m[2]) };
-  var idx = m[3] === undefined ? null : +m[3];
+  var s = { src: m[1] ? 'codex' : 'claude',
+    project: decodeURIComponent(m[2]), id: decodeURIComponent(m[3]) };
+  var idx = m[4] === undefined ? null : +m[4];
   if (current && current.project === s.project && current.id === s.id && idx != null &&
       $('#conv').querySelector('.msg[data-idx="' + idx + '"]')) { jumpToMsg(idx); return; }
   open(s, idx);
@@ -366,7 +375,8 @@ async function setFav(s, fav, note) {
   var old = JSON.stringify(favs[favKey(s)] || null);
   var r = await fetch('api/fav', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project: s.project, id: s.id, fav: fav, note: note || '' })
+    body: JSON.stringify({ project: s.project, id: s.id, src: s.src || 'claude',
+      fav: fav, note: note || '' })
   });
   var j = await r.json();
   if (!j.ok) return;
@@ -381,7 +391,7 @@ async function delSession(s) {
   if (!confirm('删除这段对话？\n\n将删除磁盘上的对话文件（含子代理侧链），不可恢复。')) return;
   var r = await fetch('api/delete', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project: s.project, id: s.id })
+    body: JSON.stringify({ project: s.project, id: s.id, src: s.src || 'claude' })
   });
   var j = await r.json().catch(function () { return {}; });
   if (!j.ok) { alert('删除失败：' + (j.error || r.status)); return; }
@@ -401,12 +411,14 @@ $('#share').onclick = async function () {
   if (!current) return;
   var r = await fetch('api/share', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project: current.project, id: current.id, days: 7 })
+    body: JSON.stringify({ project: current.project, id: current.id,
+      src: current.src || 'claude', days: 7 })
   });
   var j = await r.json();
   if (!j.token) return;
   var link = location.origin + location.pathname + '?share=' + encodeURIComponent(j.token) +
-    '#s=' + encodeURIComponent(current.project) + '/' + encodeURIComponent(current.id);
+    '#s=' + (current.src === 'codex' ? 'codex:' : '') +
+    encodeURIComponent(current.project) + '/' + encodeURIComponent(current.id);
   var note = '只读链接（' + new Date(j.exp).toLocaleDateString('zh-CN') + ' 过期）：';
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(link).then(function () {
@@ -549,8 +561,8 @@ async function switchChain(agentId, chipEl) {
   chipEl.classList.add('on');
   view.mode = agentId;
   var sc = await (await fetch('api/sidechain?project=' + encodeURIComponent(current.project) +
-    '&id=' + encodeURIComponent(current.id) + '&agent=' + encodeURIComponent(agentId) +
-    shareQ())).json();
+    '&id=' + encodeURIComponent(current.id) + '&src=' + (current.src || 'claude') +
+    '&agent=' + encodeURIComponent(agentId) + shareQ())).json();
   var conv = $('#conv'); conv.innerHTML = '';
   var wrap = document.createElement('div'); wrap.className = 'wrap';
   var head = document.createElement('div'); head.className = 'divider';
@@ -580,59 +592,130 @@ function diffBody(oldS, newS, terms) {
   });
   return '<div class="body diff">' + h + '</div>';
 }
-function toolView(name, inp, terms) {
-  var sum = '🔧 ' + esc(name);
-  var body = bodyDiv(hi(JSON.stringify(inp, null, 2) || '', terms));
-  if (name === 'Bash' && inp.command) {
-    sum = '🖥 ' + esc(clip(inp.command, 90));
-    body = bodyDiv('$ ' + hi(inp.command, terms) +
-      (inp.description ? '\n\n# ' + hi(inp.description, terms) : ''));
-  } else if (name === 'Read' && inp.file_path) {
-    sum = '📖 Read · ' + esc(shortPath(inp.file_path)) +
-      (inp.offset ? esc(' :' + inp.offset + (inp.limit ? '+' + inp.limit : '')) : '');
-  } else if (name === 'Write' && inp.file_path) {
-    sum = '📝 Write · ' + esc(shortPath(inp.file_path));
-    body = bodyDiv(hi(String(inp.content || '').slice(0, 20000), terms));
-  } else if (name === 'Edit' && inp.file_path) {
-    sum = '✏️ Edit · ' + esc(shortPath(inp.file_path)) + (inp.replace_all ? ' · 全部替换' : '');
-    body = diffBody(inp.old_string, inp.new_string, terms);
-  } else if (name === 'NotebookEdit' && inp.notebook_path) {
-    sum = '✏️ NotebookEdit · ' + esc(shortPath(inp.notebook_path));
-  } else if ((name === 'TodoWrite' || name === 'update_todos') && Array.isArray(inp.todos)) {
-    var done = inp.todos.filter(function (t) { return t.status === 'completed'; }).length;
-    sum = '📋 待办 ' + done + '/' + inp.todos.length;
-    body = bodyDiv(inp.todos.map(function (t) {
+// codex 的 apply_patch 补丁按 +/- 上色（*** Add File: 等头部行保持原样）
+function patchBody(patch, terms) {
+  var h = '';
+  String(patch).slice(0, 40000).split('\n').forEach(function (l) {
+    var c = l.charAt(0);
+    if (c === '+') h += '<span class="al">' + hi(l, terms) + '</span>';
+    else if (c === '-' && l.slice(0, 3) !== '---') h += '<span class="dl">' + hi(l, terms) + '</span>';
+    else h += hi(l, terms) + '\n';
+  });
+  return '<div class="body diff">' + h + '</div>';
+}
+// 注册表驱动：TOOL_VIEWS[工具名] = { match(inp)?, view(inp, terms, name) -> {sum, body?} }
+// match 缺省 = 只按名字命中；view 不回 body 时走通用 JSON 展示。
+// 加新工具的渲染 = 调一次 reg()，与 claude / codex 数据源无关。
+var TOOL_VIEWS = {};
+function reg(names, match, view) {
+  names.split(' ').forEach(function (n) { TOOL_VIEWS[n] = { match: match, view: view }; });
+}
+// shell 类：$ 命令 + 注释行
+function shellView(cmd, note, terms) {
+  return { sum: '🖥 ' + esc(clip(cmd, 90)),
+    body: bodyDiv('$ ' + hi(cmd, terms) + (note ? '\n\n# ' + hi(note, terms) : '')) };
+}
+// 待办 / 计划类：☑▶☐ 列表 + 完成计数
+function planView(label, items, textOf, terms) {
+  var done = items.filter(function (t) { return t.status === 'completed'; }).length;
+  return { sum: '📋 ' + label + ' ' + done + '/' + items.length,
+    body: bodyDiv(items.map(function (t) {
       var ic = t.status === 'completed' ? '☑' : t.status === 'in_progress' ? '▶' : '☐';
-      return ic + ' ' + hi(t.content || t.subject || '', terms);
-    }).join('\n'));
-  } else if ((name === 'Task' || name === 'Agent') && (inp.prompt || inp.description)) {
-    sum = '🤖 ' + esc(name) + (inp.subagent_type ? ' · ' + esc(inp.subagent_type) : '') +
-      ' · ' + esc(clip(inp.description || '', 50));
-    body = bodyDiv(hi(inp.prompt || '', terms));
-  } else if (name === 'TaskCreate' && inp.subject) {
-    sum = '📋 建任务 · ' + esc(clip(inp.subject, 70));
-    body = bodyDiv(hi(inp.subject + (inp.description ? '\n\n' + inp.description : ''), terms));
-  } else if (name === 'TaskUpdate' && inp.taskId) {
-    sum = '📋 任务 #' + esc(String(inp.taskId)) +
-      (inp.status ? ' → ' + esc(inp.status) : ' 更新');
-  } else if ((name === 'Grep' || name === 'Glob') && inp.pattern) {
-    sum = '🔍 ' + esc(name) + ' · ' + esc(clip(inp.pattern, 60)) +
-      (inp.path ? ' <span class="dim">' + esc(shortPath(inp.path)) + '</span>' : '');
-  } else if ((name === 'WebFetch' || name === 'WebSearch') && (inp.url || inp.query)) {
-    sum = '🌐 ' + esc(name) + ' · ' + esc(clip(inp.url || inp.query, 70));
-  } else if (name === 'AskUserQuestion' && Array.isArray(inp.questions)) {
-    sum = '❓ 提问 · ' + esc(clip((inp.questions[0] || {}).question || '', 60));
-    body = bodyDiv(inp.questions.map(function (q) {
-      return hi(q.question || '', terms) + '\n' + (q.options || []).map(function (o) {
-        return '  ○ ' + hi(o.label || '', terms);
+      return ic + ' ' + hi(textOf(t), terms);
+    }).join('\n')) };
+}
+reg('Bash', function (i) { return i.command; }, function (i, t) {
+  return shellView(i.command, i.description, t);
+});
+reg('exec_command', function (i) { return i.cmd; }, function (i, t) { // codex 的 shell 工具
+  return shellView(i.cmd, i.workdir ? 'cwd ' + i.workdir : '', t);
+});
+reg('Read', function (i) { return i.file_path; }, function (i) {
+  return { sum: '📖 Read · ' + esc(shortPath(i.file_path)) +
+    (i.offset ? esc(' :' + i.offset + (i.limit ? '+' + i.limit : '')) : '') };
+});
+reg('Write', function (i) { return i.file_path; }, function (i, t) {
+  return { sum: '📝 Write · ' + esc(shortPath(i.file_path)),
+    body: bodyDiv(hi(String(i.content || '').slice(0, 20000), t)) };
+});
+reg('Edit', function (i) { return i.file_path; }, function (i, t) {
+  return { sum: '✏️ Edit · ' + esc(shortPath(i.file_path)) + (i.replace_all ? ' · 全部替换' : ''),
+    body: diffBody(i.old_string, i.new_string, t) };
+});
+reg('NotebookEdit', function (i) { return i.notebook_path; }, function (i) {
+  return { sum: '✏️ NotebookEdit · ' + esc(shortPath(i.notebook_path)) };
+});
+reg('TodoWrite update_todos', function (i) { return Array.isArray(i.todos); }, function (i, t) {
+  return planView('待办', i.todos, function (x) { return x.content || x.subject || ''; }, t);
+});
+reg('update_plan', function (i) { return Array.isArray(i.plan); }, function (i, t) { // codex 的计划工具
+  return planView('计划', i.plan, function (x) { return x.step || ''; }, t);
+});
+reg('write_stdin', function (i) { return i.session_id !== undefined; }, function (i) {
+  return { sum: '⌨ write_stdin' + (i.chars ? ' · ' + esc(clip(i.chars, 60)) : ' · （等待输出）') };
+});
+reg('web_search', null, function (i) { // codex 的联网搜索（input 是 action，可能只有 type）
+  return { sum: '🌐 web_search' +
+    (i.query || i.type ? ' · ' + esc(clip(i.query || i.type, 70)) : '') };
+});
+reg('Task Agent', function (i) { return i.prompt || i.description; }, function (i, t, name) {
+  return { sum: '🤖 ' + esc(name) + (i.subagent_type ? ' · ' + esc(i.subagent_type) : '') +
+    ' · ' + esc(clip(i.description || '', 50)),
+    body: bodyDiv(hi(i.prompt || '', t)) };
+});
+reg('TaskCreate', function (i) { return i.subject; }, function (i, t) {
+  return { sum: '📋 建任务 · ' + esc(clip(i.subject, 70)),
+    body: bodyDiv(hi(i.subject + (i.description ? '\n\n' + i.description : ''), t)) };
+});
+reg('TaskUpdate', function (i) { return i.taskId; }, function (i) {
+  return { sum: '📋 任务 #' + esc(String(i.taskId)) +
+    (i.status ? ' → ' + esc(i.status) : ' 更新') };
+});
+reg('Grep Glob', function (i) { return i.pattern; }, function (i, t, name) {
+  return { sum: '🔍 ' + esc(name) + ' · ' + esc(clip(i.pattern, 60)) +
+    (i.path ? ' <span class="dim">' + esc(shortPath(i.path)) + '</span>' : '') };
+});
+reg('WebFetch WebSearch', function (i) { return i.url || i.query; }, function (i, t, name) {
+  return { sum: '🌐 ' + esc(name) + ' · ' + esc(clip(i.url || i.query, 70)) };
+});
+reg('AskUserQuestion', function (i) { return Array.isArray(i.questions); }, function (i, t) {
+  return { sum: '❓ 提问 · ' + esc(clip((i.questions[0] || {}).question || '', 60)),
+    body: bodyDiv(i.questions.map(function (q) {
+      return hi(q.question || '', t) + '\n' + (q.options || []).map(function (o) {
+        return '  ○ ' + hi(o.label || '', t);
       }).join('\n');
-    }).join('\n\n'));
-  } else if (name === 'Skill' && inp.skill) {
-    sum = '⚡ /' + esc(inp.skill) + (inp.args ? ' ' + esc(clip(inp.args, 50)) : '');
-  } else if (name === 'ExitPlanMode' || name === 'EnterPlanMode') {
-    sum = '🗺 ' + esc(name === 'EnterPlanMode' ? '进入规划模式' : '退出规划模式');
+    }).join('\n\n')) };
+});
+reg('Skill', function (i) { return i.skill; }, function (i) {
+  return { sum: '⚡ /' + esc(i.skill) + (i.args ? ' ' + esc(clip(i.args, 50)) : '') };
+});
+reg('ExitPlanMode EnterPlanMode', null, function (i, t, name) {
+  return { sum: '🗺 ' + esc(name === 'EnterPlanMode' ? '进入规划模式' : '退出规划模式') };
+});
+// 字符串 input（codex custom_tool_call：apply_patch 补丁 / exec 脚本）单独一张表
+var STR_TOOL_VIEWS = {
+  apply_patch: function (inp, terms) {
+    var pfiles = [];
+    inp.split('\n').forEach(function (l) {
+      var m = l.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
+      if (m) pfiles.push(shortPath(m[1]));
+    });
+    return { sum: '✏️ apply_patch' + (pfiles.length ? ' · ' + esc(clip(pfiles.join(', '), 80)) : ''),
+      body: patchBody(inp, terms) };
+  },
+};
+function toolView(name, inp, terms) {
+  if (typeof inp === 'string') {
+    var sv = STR_TOOL_VIEWS[name];
+    if (sv) return sv(inp, terms);
+    return { sum: '🖥 ' + esc(name) + ' · ' + esc(clip(inp, 80)),
+      body: bodyDiv(hi(inp.slice(0, 20000), terms)) };
   }
-  return { sum: sum, body: body };
+  var e = TOOL_VIEWS[name];
+  var v = e && (!e.match || e.match(inp)) ? e.view(inp, terms, name)
+    : { sum: '🔧 ' + esc(name) };
+  if (!v.body) v.body = bodyDiv(hi(JSON.stringify(inp, null, 2) || '', terms));
+  return v;
 }
 
 // ---------- 消息 ----------
@@ -644,7 +727,8 @@ function msgEl(m, terms, side, idx) {
   var el = document.createElement('div');
   el.className = 'msg ' + m.role + (side && m.role === 'assistant' ? ' agent' : '');
   var who = m.role === 'user' ? (side ? '任务' : '你') :
-            m.role === 'system' ? '系统' : (side ? '子代理' : 'Claude');
+            m.role === 'system' ? '系统' :
+            (side ? '子代理' : aiName(current && current.src));
   var inner = '';
   m.blocks.forEach(function (b) {
     if (b.kind === 'text')
@@ -788,10 +872,10 @@ function bucketDays(from, to, daysMap) {
 var UNIT_CN = { day: '每日', week: '每周', month: '每月' };
 async function openStats() {
   var r = presetRange(statsRange.preset);
-  var qs = [];
+  var qs = ['src=' + SRC];
   if (r.from) qs.push('from=' + r.from);
   if (r.to) qs.push('to=' + r.to);
-  var st = await (await fetch('api/stats' + (qs.length ? '?' + qs.join('&') : ''))).json();
+  var st = await (await fetch('api/stats?' + qs.join('&'))).json();
   current = null; view.mode = 'stats'; clearTimeout(liveTimer);
   stopPane(); hideComposer();
   $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
@@ -1025,7 +1109,7 @@ function updateCState(st) {
         o.n + '</b>' + esc(o.label) + '</button>';
     }).join('') + '</div>';
   } else if (st.kind === 'busy') {
-    h = '<div class="cbusy">✻ Claude 正在干活…（Esc 可打断，这时发的消息会排队）</div>';
+    h = '<div class="cbusy">✻ 正在干活…（Esc 可打断，这时发的消息会排队）</div>';
   }
   el.innerHTML = h;
   el.querySelectorAll('.copt').forEach(function (b) {
@@ -1199,6 +1283,31 @@ async function pollPane(t) {
   paneTimer = setTimeout(function () { pollPane(t); }, paneDelay());
 }
 
+// ---------- 数据源切换（Claude / Codex 两页独立） ----------
+function syncSrcUI() {
+  $('#srctabs').style.display = CODEX_ON ? 'flex' : 'none';
+  document.querySelectorAll('#srctabs button').forEach(function (b) {
+    b.classList.toggle('on', b.dataset.s === SRC);
+  });
+  $('#side h1').innerHTML = '<span class="dot"></span>' + aiName(SRC) + ' 对话历史';
+}
+function switchSrc(s) {
+  if (s === SRC) return;
+  SRC = s; localStorage.setItem('chv-src', s);
+  syncSrcUI();
+  // 两页独立：关掉当前会话视图，回到本源的列表
+  current = null; clearTimeout(liveTimer); stopPane(); hideComposer();
+  view.mode = 'idle';
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideHits();
+  $('#conv').innerHTML = '<div class="empty">← 选择左侧的一段对话开始查看</div>';
+  history.replaceState(null, '', location.pathname + location.search);
+  fillProjects(); $('#fproj').value = '';
+  reRun();
+}
+document.querySelectorAll('#srctabs button').forEach(function (b) {
+  b.onclick = function () { switchSrc(b.dataset.s); };
+});
+
 // ---------- 事件 ----------
 var timer = null;
 function onQuery() {
@@ -1224,6 +1333,7 @@ function showApp() {
   $('#login').style.display = 'none'; $('#side').style.display = 'flex';
   $('#main').style.display = 'flex';
   $('#menuBtn').style.display = ''; // 交回 CSS 控制（桌面隐藏/移动显示）
+  syncSrcUI();
   loadTmux();
   loadFavs().then(loadList).then(navFromHash).then(function () {
     // 移动端进来没有目标会话时，直接展开列表抽屉
@@ -1308,6 +1418,8 @@ $('#logout').onclick = async function () { await fetch('api/logout'); showLogin(
 initTheme();
 (async function () {
   var me = await (await fetch('api/me')).json();
+  CODEX_ON = !!me.codex;
+  if (!CODEX_ON && SRC === 'codex') SRC = 'claude'; // codex 关掉后别卡在空页
   if (me.authed) showApp();
   else if (SHARE) showShareView();
   else showLogin();

@@ -47,6 +47,14 @@ const SESSION_TTL = 1000 * 60 * 60 * 24 * 7; // 会话 7 天
 const TMUX_UI = process.env.TMUX_UI !== undefined
   ? !['0', 'false', 'no'].includes(String(process.env.TMUX_UI).toLowerCase())
   : !!USER_CFG.tmux;
+// codex 会话历史（~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl）：目录存在即启用
+const CODEX_ROOTS = (process.env.CODEX_SESSIONS_DIR
+  ? [process.env.CODEX_SESSIONS_DIR]
+  : (Array.isArray(USER_CFG.codexRoots) && USER_CFG.codexRoots.length
+      ? USER_CFG.codexRoots : ['~/.codex/sessions']))
+  .map((p) => path.resolve(expandHome(String(p))));
+const CODEX_ENABLED = USER_CFG.codex !== undefined ? !!USER_CFG.codex
+  : CODEX_ROOTS.some((r) => fs.existsSync(r));
 
 // ---------- 配置 / 密钥（persist 到 secret.json）----------
 const CFG = path.join(__dirname, 'secret.json');
@@ -204,6 +212,15 @@ function costOf(u, model) {
     (u.cache_creation_input_tokens || 0) * inRate * 1.25 +
     (u.cache_read_input_tokens || 0) * inRate * 0.1;
 }
+// 用量累加（parseSession / parseCodexSession 共用）：u 为 API 原始 usage 结构
+const zeroU = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 });
+function addU(t, u, model) {
+  t.in += u.input_tokens || 0; t.out += u.output_tokens || 0;
+  t.cw += u.cache_creation_input_tokens || 0; t.cr += u.cache_read_input_tokens || 0;
+  t.msgs++;
+  const c = costOf(u, model);
+  if (c != null) t.cost = (t.cost || 0) + c;
+}
 function parseSession(project, id, filePath) {
   const stat = fs.statSync(filePath);
   const raw = fs.readFileSync(filePath, 'utf8');
@@ -217,14 +234,6 @@ function parseSession(project, id, filePath) {
   // usageByDay：日期 -> 模型 -> 用量（按天+按模型的汇总都从这里推，支持任意时间区间）
   // 无时间戳的记录落在 '' 这一档，只计入「全部时间」
   const usageByDay = {}, msgsByDay = {};
-  const zeroU = () => ({ in: 0, out: 0, cw: 0, cr: 0, msgs: 0, cost: 0 });
-  const addU = (t, u, model) => {
-    t.in += u.input_tokens || 0; t.out += u.output_tokens || 0;
-    t.cw += u.cache_creation_input_tokens || 0; t.cr += u.cache_read_input_tokens || 0;
-    t.msgs++;
-    const c = costOf(u, model);
-    if (c != null) t.cost = (t.cost || 0) + c;
-  };
   const addUsage = (msg, ts) => {
     const u = msg.usage;
     if (!u) return;
@@ -310,7 +319,7 @@ function parseSession(project, id, filePath) {
   const chains = [...sidechains.values()].sort((a, b) =>
     String(a.firstTs || '').localeCompare(String(b.firstTs || '')));
   return {
-    project, id, title: title || firstPrompt || '(无标题)', firstPrompt,
+    project, id, src: 'claude', title: title || firstPrompt || '(无标题)', firstPrompt,
     cwd, gitBranch, agentName, mtime: stat.mtimeMs, firstTs, lastTs,
     msgCount: messages.length, summaries,
     usage, usageByDay, msgsByDay,
@@ -325,6 +334,188 @@ function sidechainFiles(sessionDir) {
       .map((f) => ({ name: f, path: path.join(dir, f) }));
   } catch { return []; }
 }
+// ---------- codex 会话解析 ----------
+// codex 的 rollout-*.jsonl：每行 {timestamp, type, payload}。对话正文取 response_item
+// （event_msg 的 user_message/agent_message 与之重复，只用 event_msg 拿 token 用量）。
+const CODEX_ID_RE = /^rollout-(\d{4})-(\d{2})-(\d{2})T\d{2}-\d{2}-\d{2}-[0-9a-fA-F-]+$/;
+// 在各 codex 根中按 id 里的日期定位文件（目录即 YYYY/MM/DD，无需全树扫描）
+function codexFile(id) {
+  const m = CODEX_ID_RE.exec(id || '');
+  if (!m) return null;
+  for (const root of CODEX_ROOTS) {
+    const fp = path.join(root, m[1], m[2], m[3], id + '.jsonl');
+    if (fs.existsSync(fp)) return fp;
+  }
+  return null;
+}
+// codex 没有项目目录，用 cwd 按 claude 同款规则编码出项目名（与前端 encCwd 一致）
+function codexProject(cwd) {
+  return (cwd ? String(cwd).replace(/[^A-Za-z0-9]/g, '-') : '') || 'codex';
+}
+// 会话标题来自 ~/.codex/session_index.jsonl（uuid -> thread_name），mtime 变了才重读
+let codexTitleCache = { stamp: '', map: new Map() };
+function codexTitles() {
+  let stamp = '';
+  const files = CODEX_ROOTS.map((r) => path.join(r, '..', 'session_index.jsonl'));
+  for (const fp of files) {
+    try { stamp += fp + ':' + fs.statSync(fp).mtimeMs + ';'; } catch { /* 无索引 */ }
+  }
+  if (stamp === codexTitleCache.stamp) return codexTitleCache.map;
+  const map = new Map();
+  for (const fp of files) {
+    let raw = '';
+    try { raw = fs.readFileSync(fp, 'utf8'); } catch { continue; }
+    for (const line of raw.split('\n')) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        const o = JSON.parse(s);
+        if (o.id && o.thread_name) map.set(o.id, o.thread_name);
+      } catch { /* skip */ }
+    }
+  }
+  codexTitleCache = { stamp, map };
+  return map;
+}
+// user 消息里的环境包裹（<environment_context> 等）按 meta 隐藏
+const CODEX_META_RE =
+  /^(<(environment_context|permissions|user_instructions|turn_aborted|turn_context|recommended_plugins|user_shell_command|collaboration_mode|AGENTS)|# AGENTS\.md instructions)/;
+function parseCodexSession(id, filePath) {
+  const stat = fs.statSync(filePath);
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const messages = [];
+  let cwd = '', gitBranch = '', model = '', firstPrompt = '', threadSource = '';
+  let firstTs = null, lastTs = null;
+  const usage = zeroU(), usageByDay = {}, msgsByDay = {};
+  const addTok = (u, ts) => {
+    addU(usage, u, model || '(unknown)');
+    const day = ts ? String(ts).slice(0, 10) : '';
+    const byModel = usageByDay[day] = usageByDay[day] || {};
+    addU(byModel[model || '(unknown)'] = byModel[model || '(unknown)'] || zeroU(), u, model);
+  };
+  const push = (role, ts, isMeta, blocks, extra) => {
+    if (!blocks.length) return;
+    if (ts) { if (!firstTs) firstTs = ts; lastTs = ts; }
+    const day = ts ? String(ts).slice(0, 10) : '';
+    msgsByDay[day] = (msgsByDay[day] || 0) + 1;
+    messages.push(Object.assign({ role, ts, isMeta, blocks }, extra));
+  };
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    let o;
+    try { o = JSON.parse(s); } catch { continue; }
+    const p = o.payload || {};
+    const ts = o.timestamp || null;
+    if (o.type === 'session_meta') {
+      if (p.cwd) cwd = p.cwd;
+      if (p.git && p.git.branch) gitBranch = p.git.branch;
+      if (p.timestamp && !firstTs) firstTs = p.timestamp;
+      if (p.thread_source) threadSource = String(p.thread_source);
+      continue;
+    }
+    if (o.type === 'turn_context') {
+      if (p.cwd) cwd = p.cwd;
+      if (p.model) model = p.model;
+      continue;
+    }
+    if (o.type === 'compacted') {
+      push('system', ts, false,
+        [{ kind: 'compact', text: '—— 上下文已压缩，此处之前的内容被摘要替代 ——' }]);
+      continue;
+    }
+    if (o.type === 'event_msg') {
+      // token_count 才是用量的唯一来源；in 里已含缓存读，拆开对齐 claude 的口径
+      if (p.type === 'token_count' && p.info && p.info.last_token_usage) {
+        const u = p.info.last_token_usage;
+        const cr = u.cached_input_tokens || 0;
+        addTok({
+          input_tokens: Math.max(0, (u.input_tokens || 0) - cr),
+          output_tokens: u.output_tokens || 0,
+          cache_read_input_tokens: cr,
+        }, ts);
+      } else if (p.type === 'turn_aborted') {
+        push('system', ts, false, [{ kind: 'compact', text: '—— 已被打断 ——' }]);
+      } else if (p.type === 'error' && p.message) {
+        push('system', ts, false, [{ kind: 'text', text: '⚠ ' + p.message }]);
+      }
+      continue;
+    }
+    if (o.type !== 'response_item') continue;
+    switch (p.type) {
+      case 'message': {
+        const role = p.role === 'assistant' ? 'assistant' : 'user';
+        const text = (Array.isArray(p.content) ? p.content : [])
+          .map((c) => (c && (c.text || '')) || '').join('\n').trim();
+        if (!text) break;
+        const isMeta = (p.role !== 'user' && p.role !== 'assistant') || CODEX_META_RE.test(text);
+        // 续接/子代理线程开头注入的整段历史：折叠成「压缩摘要」而不是展开一大坨
+        const isHistory = /^The following is the Codex agent history/.test(text);
+        if (!firstPrompt && role === 'user' && !isMeta && !isHistory)
+          firstPrompt = text.slice(0, 200);
+        push(role, ts, isMeta, [{ kind: 'text', text }], isHistory ? { compact: true } : null);
+        break;
+      }
+      case 'reasoning': {
+        // content 是加密的，只有 summary 可读
+        const blocks = (Array.isArray(p.summary) ? p.summary : [])
+          .map((x) => x && x.text).filter(Boolean)
+          .map((t) => ({ kind: 'thinking', text: t }));
+        push('assistant', ts, false, blocks);
+        break;
+      }
+      case 'function_call': {
+        let input = {};
+        try { input = JSON.parse(p.arguments); } catch { input = { arguments: p.arguments }; }
+        push('assistant', ts, false, [{ kind: 'tool_use', name: p.name || 'tool', input }]);
+        break;
+      }
+      case 'custom_tool_call':
+        push('assistant', ts, false,
+          [{ kind: 'tool_use', name: p.name || 'tool', input: p.input }]);
+        break;
+      case 'web_search_call':
+        push('assistant', ts, false,
+          [{ kind: 'tool_use', name: 'web_search', input: p.action || {} }]);
+        break;
+      case 'tool_search_call':
+        push('assistant', ts, false,
+          [{ kind: 'tool_use', name: 'tool_search', input: p.arguments || {} }]);
+        break;
+      case 'function_call_output':
+      case 'custom_tool_call_output': {
+        let text = typeof p.output === 'string' ? p.output : JSON.stringify(p.output);
+        let isError = /exited with code [1-9]/.test(text || '');
+        // custom_tool_call_output 的 output 常是再包一层的 JSON {output, metadata}
+        try {
+          const inner = JSON.parse(text);
+          if (inner && typeof inner.output === 'string') {
+            text = inner.output;
+            if (inner.metadata && inner.metadata.exit_code) isError = true;
+          }
+        } catch { /* 纯文本 */ }
+        push('user', ts, false, [{ kind: 'tool_result', text: text || '', isError }]);
+        break;
+      }
+      case 'tool_search_output':
+        push('user', ts, false,
+          [{ kind: 'tool_result', text: JSON.stringify(p.tools || p, null, 1), isError: false }]);
+        break;
+      default: break;
+    }
+  }
+  const uuid = id.slice(-36);
+  const title = codexTitles().get(uuid) || '';
+  return {
+    project: codexProject(cwd), id, src: 'codex', threadSource,
+    title: title || firstPrompt || '(无标题)', firstPrompt,
+    cwd, gitBranch, agentName: '', mtime: stat.mtimeMs, firstTs, lastTs,
+    msgCount: messages.length, summaries: [],
+    usage, usageByDay, msgsByDay,
+    sidechains: [], messages,
+  };
+}
+
 // 子代理文件的变化也要让缓存失效：取全部相关文件 mtime 拼校验戳
 function cacheStamp(filePath) {
   let stamp = String(fs.statSync(filePath).mtimeMs);
@@ -364,6 +555,84 @@ function saveFavs() {
 const cache = new Map();
 const CACHE_MAX = 100;
 const NAME_RE = /^[A-Za-z0-9._-]+$/; // 防路径穿越
+// ---------- 数据源适配器 ----------
+// claude / codex 的差异全部收敛在这张表里，索引 / 加载 / 删除的主流程与源无关；
+// 以后再接别的 agent CLI 历史 = 加一个对象。每个源实现：
+//   enabled          — 是否启用（refreshIndex 是否扫描）
+//   key(project,id)  — 索引 / 缓存 / 收藏键（claude 保持 project/<id>，老 index.json 继续有效）
+//   scan(visit)      — 遍历全部会话文件，对每个调 visit(project, id, filePath)；
+//                      项目名要解析后才知道的源（codex 按 cwd 推导）传 null
+//   locate(project,id)、stamp(filePath)、parse(project,id,filePath)
+//   listable(session)— 解析后是否进列表（codex 用来滤 subagent 线程）
+//   remove(filePath) — 删除会话文件（连带附属文件），失败回 false
+const SOURCES = {
+  claude: {
+    enabled: true,
+    key: (project, id) => project + '/' + id,
+    scan(visit) { // roots/<project>/<id>.jsonl：目录名即项目名，排除规则在这里就能挡住
+      for (const root of ROOTS) {
+        let projects;
+        try { projects = fs.readdirSync(root); } catch { continue; }
+        for (const project of projects) {
+          if (isExcluded(project) || !NAME_RE.test(project)) continue;
+          const pdir = path.join(root, project);
+          let files;
+          try {
+            if (!fs.statSync(pdir).isDirectory()) continue;
+            files = fs.readdirSync(pdir).filter((f) => f.endsWith('.jsonl'));
+          } catch { continue; }
+          for (const f of files) {
+            const id = f.slice(0, -6);
+            if (NAME_RE.test(id)) visit(project, id, path.join(pdir, f));
+          }
+        }
+      }
+    },
+    locate: sessionFile,
+    stamp: cacheStamp,
+    parse: parseSession,
+    listable: () => true,
+    remove(fp) { // 连带 <id>/subagents 子代理目录
+      try { fs.unlinkSync(fp); } catch { return false; }
+      try { fs.rmSync(fp.slice(0, -6), { recursive: true, force: true }); } catch { /* 无子代理目录 */ }
+      return true;
+    },
+  },
+  codex: {
+    enabled: CODEX_ENABLED,
+    key: (project, id) => 'codex:' + id, // id 全局唯一，项目名（cwd 推导，可变）不进键
+    scan(visit) { // sessions/YYYY/MM/DD/rollout-*.jsonl
+      for (const root of CODEX_ROOTS) {
+        let days;
+        try {
+          days = fs.readdirSync(root).filter((y) => /^\d{4}$/.test(y)).flatMap((y) =>
+            fs.readdirSync(path.join(root, y)).filter((m) => /^\d{2}$/.test(m)).flatMap((m) =>
+              fs.readdirSync(path.join(root, y, m)).filter((d) => /^\d{2}$/.test(d))
+                .map((d) => path.join(root, y, m, d))));
+        } catch { continue; }
+        for (const dir of days) {
+          let files;
+          try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')); } catch { continue; }
+          for (const f of files) {
+            const id = f.slice(0, -6);
+            if (NAME_RE.test(id) && CODEX_ID_RE.test(id)) visit(null, id, path.join(dir, f));
+          }
+        }
+      }
+    },
+    locate: (project, id) => codexFile(id),
+    stamp: (fp) => String(fs.statSync(fp).mtimeMs),
+    parse: (project, id, fp) => parseCodexSession(id, fp),
+    // 子代理线程（guardian 审批评估等）是机器噪音，不进列表；文件保留，直连 id 仍可打开
+    listable: (s) => s.threadSource !== 'subagent',
+    remove(fp) {
+      try { fs.unlinkSync(fp); } catch { return false; }
+      return true;
+    },
+  },
+};
+function srcOf(q) { return SOURCES[q] ? q : 'claude'; }
+function keyOf(src, project, id) { return SOURCES[srcOf(src)].key(project, id); }
 const INDEX_PATH = process.env.INDEX_PATH || path.join(__dirname, 'index.json');
 const BLOBS_PATH = process.env.INDEX_BLOBS_PATH || INDEX_PATH.replace(/\.json$/, '') + '.blobs.json';
 const BLOB_TTL = Number(process.env.BLOB_TTL_MS) || 5 * 60 * 1000; // 闲置多久后释放 blob 内存
@@ -441,13 +710,13 @@ function searchBlobs(s) {
   return { text, think };
 }
 // 取某会话的 blob：blobs.json 里缺失 / stamp 过期就解析该会话重建（自愈）
-function blobFor(project, id) {
-  const key = project + '/' + id;
+function blobFor(sum) {
+  const key = keyOf(sum.src, sum.project, sum.id);
   const stamp = INDEX.get(key) && INDEX.get(key).stamp;
   const store = ensureBlobs();
   let b = store.get(key);
   if (b && b.stamp === stamp) return b;
-  const s = loadSession(project, id);
+  const s = loadSession(sum.project, sum.id, sum.src);
   if (!s) return { stamp, text: '', think: '' };
   b = { stamp, ...searchBlobs(s) };
   store.set(key, b);
@@ -470,70 +739,60 @@ function refreshIndex(force) {
   lastScan = now;
   const live = new Set();
   let changed = false;
-  for (const root of ROOTS) {
-    let projects;
-    try { projects = fs.readdirSync(root); } catch { continue; }
-    for (const project of projects) {
-      if (isExcluded(project) || !NAME_RE.test(project)) continue;
-      const pdir = path.join(root, project);
-      let files;
+  for (const S of Object.values(SOURCES)) {
+    if (!S.enabled) continue;
+    S.scan((project, id, fp) => {
+      const key = S.key(project, id);
+      if (live.has(key)) return; // 同名会话多根并存时先配置的根优先
+      live.add(key);
+      let stamp;
+      try { stamp = S.stamp(fp); } catch { return; }
+      const hit = INDEX.get(key);
+      if (hit && hit.stamp === stamp) return; // 未变，跳过重解析
       try {
-        if (!fs.statSync(pdir).isDirectory()) continue;
-        files = fs.readdirSync(pdir).filter((f) => f.endsWith('.jsonl'));
-      } catch { continue; }
-      for (const f of files) {
-        const id = f.slice(0, -6);
-        if (!NAME_RE.test(id)) continue;
-        const key = project + '/' + id;
-        if (live.has(key)) continue; // 同名会话多根并存时先配置的根优先
-        live.add(key);
-        let stamp;
-        try { stamp = cacheStamp(path.join(pdir, f)); } catch { continue; }
-        const hit = INDEX.get(key);
-        if (hit && hit.stamp === stamp) continue; // 未变，跳过重解析
-        try {
-          const s = parseSession(project, id, path.join(pdir, f));
-          if (!s.msgCount) { if (INDEX.delete(key)) changed = true; continue; }
-          INDEX.set(key, indexEntry(s, stamp));
-          if (BLOBS) { BLOBS.set(key, { stamp, ...searchBlobs(s) }); blobsDirty = true; } // 已载入才顺带更新
-          changed = true;
-        } catch { /* skip */ }
-      }
-    }
+        const s = S.parse(project, id, fp);
+        if (!s.msgCount || !S.listable(s)) { if (INDEX.delete(key)) changed = true; return; }
+        INDEX.set(key, indexEntry(s, stamp));
+        if (BLOBS) { BLOBS.set(key, { stamp, ...searchBlobs(s) }); blobsDirty = true; } // 已载入才顺带更新
+        changed = true;
+      } catch { /* skip */ }
+    });
   }
   for (const key of [...INDEX.keys()]) {          // 清理已删除 / 已排除的会话
     if (!live.has(key)) { INDEX.delete(key); if (BLOBS) BLOBS.delete(key); changed = true; }
   }
   if (changed) { scheduleSave(); if (BLOBS && blobsDirty) scheduleBlobSave(); }
 }
-function loadSession(project, id) {
+function loadSession(project, id, src) {
+  const S = SOURCES[srcOf(src)];
   if (!NAME_RE.test(project || '') || !NAME_RE.test(id || '')) return null;
   if (isExcluded(project)) return null;
-  const filePath = sessionFile(project, id);
+  const filePath = S.locate(project, id);
   if (!filePath) return null;
-  const stamp = cacheStamp(filePath);
-  const key = project + '/' + id;
+  const stamp = S.stamp(filePath);
+  const key = S.key(project, id);
   const hit = cache.get(key);
   if (hit && hit.stamp === stamp) {
     cache.delete(key); cache.set(key, hit); // LRU 提前
     return hit.session;
   }
-  const session = parseSession(project, id, filePath);
+  const session = S.parse(project, id, filePath);
+  // 项目名由解析推导的源（codex 按 cwd）：请求的 project 与推导不符（或被排除）就当不存在
+  if (session.project !== project || isExcluded(session.project)) return null;
   cache.set(key, { stamp, session });
   const ie = INDEX.get(key);              // 顺带刷新摘要索引，保持索引与打开的会话同步
   if (!ie || ie.stamp !== stamp) { INDEX.set(key, indexEntry(session, stamp)); scheduleSave(); }
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   return session;
 }
-// 删除会话：删掉 .jsonl 与其 <id>/subagents 目录，并清掉各级缓存 / 索引 / 收藏
-function deleteSession(project, id) {
-  if (!NAME_RE.test(project || '') || !NAME_RE.test(id || '')) return false;
-  if (isExcluded(project)) return false;
-  const filePath = sessionFile(project, id);
-  if (!filePath) return false;
-  try { fs.unlinkSync(filePath); } catch { return false; }
-  try { fs.rmSync(filePath.slice(0, -6), { recursive: true, force: true }); } catch { /* 无子代理目录 */ }
-  const key = project + '/' + id;
+// 删除会话：删掉会话文件（连带附属文件，见各源 remove），并清掉各级缓存 / 索引 / 收藏
+function deleteSession(project, id, src) {
+  src = srcOf(src);
+  const S = SOURCES[src];
+  if (!loadSession(project, id, src)) return false; // 顺带完成白名单 / 排除 / 项目归属校验
+  const filePath = S.locate(project, id);
+  if (!filePath || !S.remove(filePath)) return false;
+  const key = S.key(project, id);
   cache.delete(key); INDEX.delete(key);
   if (BLOBS) BLOBS.delete(key);
   scheduleSave(); if (BLOBS) scheduleBlobSave();
@@ -552,14 +811,16 @@ function listAll() {
 }
 function summary(s) {
   return {
-    project: s.project, id: s.id, title: s.title, firstPrompt: s.firstPrompt,
+    project: s.project, id: s.id, src: s.src || 'claude',
+    title: s.title, firstPrompt: s.firstPrompt,
     cwd: s.cwd, gitBranch: s.gitBranch, agentName: s.agentName, mtime: s.mtime,
     firstTs: s.firstTs, lastTs: s.lastTs, msgCount: s.msgCount,
     sidechainCount: s.sidechains.length, hasSummary: s.summaries.length > 0,
     usage: s.usage, usageByDay: s.usageByDay, msgsByDay: s.msgsByDay,
   };
 }
-function search(q, includeThinking) {
+function search(q, includeThinking, src) {
+  src = srcOf(src);
   const query = q.toLowerCase().trim();
   if (!query) return [];
   const terms = query.split(/\s+/).filter(Boolean);
@@ -567,16 +828,17 @@ function search(q, includeThinking) {
   const results = [];
   for (const e of INDEX.values()) {
     const sum = e.summary;
+    if ((sum.src || 'claude') !== src) continue;   // claude / codex 两页独立搜索
     if (isExcluded(sum.project)) continue;
     const titleLc = (sum.title + ' ' + (sum.firstPrompt || '')).toLowerCase();
     const titleHit = terms.every((term) => titleLc.includes(term));
     // 粗筛：全部词都在正文（或含思考时并入思考）blob 里，才可能有精确命中
-    const blob = blobFor(sum.project, sum.id);
+    const blob = blobFor(sum);
     const hay = includeThinking ? blob.text + '\n' + blob.think : blob.text;
     const bodyCand = terms.every((term) => hay.includes(term));
     if (!bodyCand && !titleHit) continue;
     if (!bodyCand) { results.push({ ...sum, hits: 0, titleHit: true, snippet: null }); continue; }
-    const s = loadSession(sum.project, sum.id); // 命中候选才全量解析，逐块算精确命中数与片段
+    const s = loadSession(sum.project, sum.id, sum.src); // 命中候选才全量解析，逐块算精确命中数与片段
     if (!s) continue;
     let hits = 0, snippet = null;
     const scan = (m, side) => {
@@ -612,10 +874,11 @@ function makeSnippet(text, terms, role, kind) {
 }
 
 // ---------- Markdown 导出 ----------
-function mdMessages(L, messages) {
+function mdMessages(L, messages, aiName) {
   for (const m of messages) {
     if (m.isMeta) continue;
-    const who = m.role === 'user' ? '🧑 你' : m.role === 'system' ? '⚙ 系统' : '🤖 Claude';
+    const who = m.role === 'user' ? '🧑 你' : m.role === 'system' ? '⚙ 系统'
+      : '🤖 ' + (aiName || 'Claude');
     const t = m.ts ? '  _' + new Date(m.ts).toISOString() + '_' : '';
     L.push('---', '', '### ' + who + (m.compact ? '（压缩摘要）' : '') + t, '');
     for (const b of m.blocks) {
@@ -643,10 +906,11 @@ function toMarkdown(s) {
   for (const sum of s.summaries) {
     L.push('<details><summary>📦 历史摘要（压缩续接）</summary>', '', sum, '', '</details>', '');
   }
-  mdMessages(L, s.messages);
+  const aiName = s.src === 'codex' ? 'Codex' : 'Claude';
+  mdMessages(L, s.messages, aiName);
   for (const sc of s.sidechains) {
     L.push('', '## 🤖 子代理：' + (sc.firstPrompt || sc.agentId), '');
-    mdMessages(L, sc.messages);
+    mdMessages(L, sc.messages, aiName);
   }
   return L.join('\n');
 }
@@ -676,7 +940,7 @@ async function tmuxPanes() {
     const [id, session, win, winName, paneIdx, cmd, cwd, active, w, h] = l.split('\u241f');
     return { id, session, win: +win, winName, paneIdx: +paneIdx, cmd, cwd,
       active: active === '1', w: +w, h: +h,
-      claude: /^(claude|node|bun)$/.test(cmd) }; // claude CLI 的进程名可能是 node/bun
+      claude: /^(claude|codex|node|bun)$/.test(cmd) }; // agent CLI 的进程名可能是 node/bun
   });
 }
 // 去掉 ANSI 转义（SGR / 光标控制 / OSC 标题等），留纯文本供状态解析
@@ -776,7 +1040,7 @@ const server = http.createServer(async (req, res) => {
       res.end(fs.readFileSync(APP_JS));
       return;
     }
-    if (p === '/api/me') { sendJSON(res, { authed: isAuthed(req) }); return; }
+    if (p === '/api/me') { sendJSON(res, { authed: isAuthed(req), codex: CODEX_ENABLED }); return; }
     if (p === '/api/login' && req.method === 'POST') {
       const ip = clientIp(req);
       const lock = checkLock(ip);
@@ -798,14 +1062,15 @@ const server = http.createServer(async (req, res) => {
     // 鉴权：登录会话，或限定单个会话的只读分享 token（?share=）
     const authed = isAuthed(req);
     const shareTok = url.searchParams.get('share');
-    const share = shareTok ? verifyToken(shareTok) : null; // {sp, si, exp}
+    const share = shareTok ? verifyToken(shareTok) : null; // {sp, si, sr?, exp}
+    const src = srcOf(url.searchParams.get('src')); // 数据源：claude（默认）| codex
     const canRead = (project, id) =>
-      authed || (!!share && share.sp === project && share.si === id);
+      authed || (!!share && share.sp === project && share.si === id && srcOf(share.sr) === src);
 
     if (p === '/api/session') {
       const project = url.searchParams.get('project'), id = url.searchParams.get('id');
       if (!canRead(project, id)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
-      const s = loadSession(project, id);
+      const s = loadSession(project, id, src);
       if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
       // meta=1：只回元信息（供实时轮询比对），不带消息体
       if (url.searchParams.get('meta') === '1') {
@@ -831,7 +1096,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/sidechain') {
       const project = url.searchParams.get('project'), id = url.searchParams.get('id');
       if (!canRead(project, id)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
-      const s = loadSession(project, id);
+      const s = loadSession(project, id, src);
       if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
       const sc = s.sidechains.find((x) => x.agentId === url.searchParams.get('agent'));
       if (!sc) { sendJSON(res, { error: 'not found' }, 404); return; }
@@ -840,7 +1105,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/export') {
       const project = url.searchParams.get('project'), id = url.searchParams.get('id');
       if (!canRead(project, id)) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
-      const s = loadSession(project, id);
+      const s = loadSession(project, id, src);
       if (!s) { sendJSON(res, { error: 'not found' }, 404); return; }
       const fn = (s.title || 'session').replace(/[^\w一-龥-]+/g, '_').slice(0, 60);
       res.writeHead(200, {
@@ -863,7 +1128,9 @@ const server = http.createServer(async (req, res) => {
       }
       const days = Math.min(30, Math.max(1, +body.days || 7));
       const exp = Date.now() + days * 86400e3;
-      sendJSON(res, { token: signToken({ sp: body.project, si: body.id, exp }), exp });
+      const tok = { sp: body.project, si: body.id, exp };
+      if (srcOf(body.src) === 'codex') tok.sr = 'codex';
+      sendJSON(res, { token: signToken(tok), exp });
       return;
     }
     if (p === '/api/favs') { sendJSON(res, FAVS); return; }
@@ -873,7 +1140,7 @@ const server = http.createServer(async (req, res) => {
       if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
         sendJSON(res, { error: 'bad request' }, 400); return;
       }
-      const key = body.project + '/' + body.id;
+      const key = keyOf(srcOf(body.src), body.project, body.id);
       if (body.fav) FAVS[key] = { note: String(body.note || '').slice(0, 500), ts: Date.now() };
       else delete FAVS[key];
       saveFavs();
@@ -886,7 +1153,7 @@ const server = http.createServer(async (req, res) => {
       if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
         sendJSON(res, { error: 'bad request' }, 400); return;
       }
-      if (!deleteSession(body.project, body.id)) {
+      if (!deleteSession(body.project, body.id, body.src)) {
         sendJSON(res, { error: 'not found' }, 404); return;
       }
       sendJSON(res, { ok: true }); return;
@@ -919,6 +1186,7 @@ const server = http.createServer(async (req, res) => {
         if (day > maxDay) maxDay = day;
       };
       for (const s of listAll()) {
+        if ((s.src || 'claude') !== src) continue; // 两页统计独立
         let hit = false;                          // 该会话在区间内是否有数据
         for (const [day, models] of Object.entries(s.usageByDay || {})) {
           bound(day);
@@ -947,7 +1215,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/search') {
       const inc = url.searchParams.get('thinking') === '1';
-      sendJSON(res, search(url.searchParams.get('q') || '', inc)); return;
+      sendJSON(res, search(url.searchParams.get('q') || '', inc, src)); return;
     }
     // ---- tmux 桥接（仅登录可用，不接受分享 token；默认关闭需显式开启）----
     if (p === '/api/tmux') { // 窗格列表；未开启时回 enabled:false，前端据此隐藏入口
@@ -1049,7 +1317,7 @@ const server = http.createServer(async (req, res) => {
 // 供 node:test 复用纯函数（被 require 时不启动服务器）
 module.exports = {
   globToRe, isExcluded, extractBlocks, toolResultText, plainText,
-  priceFor, costOf, parseSession, searchBlobs, indexEntry,
+  priceFor, costOf, parseSession, parseCodexSession, codexProject, searchBlobs, indexEntry,
   refreshIndex, listAll, search, loadSession, deleteSession, summary, INDEX,
   saveIndex, saveBlobs, // 供测试强制落盘（生产走 3s 防抖）
   stripAnsi, paneState, // tmux 桥接的纯函数
@@ -1062,6 +1330,7 @@ if (require.main === module) {
     console.log('  扫描根目录：' + ROOTS.join('，'));
     if (EXCLUDE.length) console.log('  排除规则：' + (USER_CFG.exclude || []).join('，'));
     console.log('  tmux 桥接：' + (TMUX_UI ? '已开启（网页可向 tmux 会话发送按键）' : '未开启'));
+    console.log('  codex 历史：' + (CODEX_ENABLED ? CODEX_ROOTS.join('，') : '未启用'));
     if (generated) {
       console.log('\n  ⚠ 已生成随机登录密码（也写入 secret.json）：');
       console.log('      ' + generated + '\n');
@@ -1132,6 +1401,11 @@ button,select,input{font-family:inherit}
 .iconbtn{border:1px solid var(--line);background:var(--field);color:var(--muted);border-radius:8px;
   width:30px;height:30px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center}
 .iconbtn:hover{color:var(--ink);border-color:var(--accent)}
+/* 数据源切换（Claude / Codex 两页独立） */
+#srctabs{display:none;margin-bottom:8px;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+#srctabs button{flex:1;border:0;background:var(--field);color:var(--muted);padding:6px 0;
+  font-size:12.5px;cursor:pointer}
+#srctabs button.on{background:var(--accent);color:#fff;font-weight:600}
 #q{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:9px;
   background:var(--field);color:var(--ink);font-size:13px;outline:none}
 #q:focus{border-color:var(--accent)}
@@ -1412,6 +1686,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
         <button class="iconbtn" id="logout" title="退出登录">⏻</button>
       </div>
     </div>
+    <div id="srctabs"><button data-s="claude" class="on">Claude</button><button data-s="codex">Codex</button></div>
     <input id="q" placeholder="模糊搜索标题 / 内容…" autocomplete="off">
     <div class="filters">
       <select id="fproj"><option value="">全部项目</option></select>

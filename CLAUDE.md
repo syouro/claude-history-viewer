@@ -23,9 +23,34 @@
 ## 关键约定
 
 - **环境变量始终优先于 config.json**（`PORT`/`HOST`/`COOKIE_PATH`/`SECURE_COOKIE`/
-  `VIEWER_PASSWORD`/`CLAUDE_PROJECTS_DIR`/`CONFIG_PATH`/`INDEX_PATH`）。
+  `VIEWER_PASSWORD`/`CLAUDE_PROJECTS_DIR`/`CODEX_SESSIONS_DIR`/`CONFIG_PATH`/`INDEX_PATH`）。
 - **多根扫描**：`roots` 可配多个；同名 项目/会话 在多根并存时**先配置的根优先**。
-- **排除**：`exclude` 按项目目录名做 glob（`*` `?`）匹配，命中的项目既不列出、API 也拒绝。
+- **排除**：`exclude` 按项目目录名做 glob（`*` `?`）匹配，命中的项目既不列出、API 也拒绝
+  （对 codex 按 cwd 推导出的项目名同样生效）。
+
+## codex 数据源（Claude / Codex 两页独立）
+
+- **数据源适配器 `SOURCES`**：claude / codex 的差异（scan / locate / stamp / parse /
+  listable / remove / key）全部收敛在这张表里，`refreshIndex` / `loadSession` /
+  `deleteSession` 主流程与源无关；**再接别的 agent CLI = 加一个对象**，主流程不动。
+  同理前端工具渲染是注册表 `TOOL_VIEWS`（对象 input）+ `STR_TOOL_VIEWS`（字符串 input），
+  加新工具的展示 = 调一次 `reg()`。
+- 所有涉及会话的 API 都带 `src` 参数（`claude` 默认 / `codex`）；前端 `SRC` 全局 + 页签切换，
+  列表 / 搜索 / 统计 / 收藏互不混。分享 token 里 codex 会话带 `sr` 字段，跨源冒充会被拒。
+- `codexRoots`（默认 `~/.codex/sessions`，目录存在即启用，`"codex": false` 可强关）：
+  `YYYY/MM/DD/rollout-<时间>-<uuid>.jsonl`，**id 里带日期，可直接推出文件路径**（`codexFile()`）。
+- `parseCodexSession()` 的坑：
+  - 正文只取 `response_item`（`event_msg` 的 user_message/agent_message 与之**重复**，
+    只用其中的 `token_count.last_token_usage` 记用量；`input_tokens` 含缓存读，要拆开）；
+  - 思考在 `reasoning.summary[]`（`content` 是加密的）；模型名来自 `turn_context`；
+  - `custom_tool_call` 的 `input` 是**字符串**（apply_patch 补丁 / exec 脚本），前端 `toolView`
+    对字符串 input 单独处理；
+  - 环境包裹（`<environment_context>`、`# AGENTS.md instructions` 等）标 `isMeta` 隐藏，
+    见 `CODEX_META_RE`；续接注入的 `The following is the Codex agent history` 整段标
+    `compact` 折叠；`thread_source === 'subagent'`（guardian 审批评估等）整个会话不进索引。
+- 索引键：claude 仍是 `project/<id>`（老 index.json 有效），codex 用 `codex:<id>`；
+  codex 无项目目录，项目名由 cwd 编码（`codexProject()`，与前端 `encCwd` 同款）。
+- 会话标题优先取 `~/.codex/session_index.jsonl` 的 thread_name，缺省用首条用户消息。
 
 ## tmux 桥接（网页控制台）
 
