@@ -104,6 +104,31 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
 - `android/` — Android shell app (WebView, see below)
 - `.github/workflows/android.yml` — GitHub Actions workflow that builds the APK on tag push
 
+## Design decisions
+
+- **Zero dependencies** — no express / database / markdown library: hand-written routing
+  and auth on the backend, a hand-written Markdown renderer on the frontend, JSON files as
+  the "database". Deployment = two files + Node, no supply chain; the renderer covers the
+  common GFM subset and falls back to plain text for anything it doesn't recognize.
+- **Two-tier index** — session summaries stay resident in memory; search blobs are
+  lazy-loaded from disk and released after idling. Search pre-filters on blobs and only
+  fully parses candidate sessions. Built for small-memory VPSes: browsing costs almost no
+  memory, at the price of one extra disk read on the first search after a cold start. All
+  indexes are derived data — delete them any time; the jsonl files are the only source of truth.
+- **The tmux bridge is a translation layer, not a web terminal** — it captures the pane,
+  parses the interaction state (menu / busy / idle) and renders native controls, which is
+  what makes it usable on a phone; unparseable screens fall back to a raw terminal view.
+  The TUI-parsing pitfalls (octal escapes, `>` vs `❯` prompts, strict menu detection to
+  avoid false positives) are all pinned down by tests.
+- **Sharing is deliberately weak, remote control deliberately narrow** — share tokens are
+  scoped to one session: no listing, no search, no impersonating a login. tmux routes are
+  off by default, login-only, with a whitelist for named keys. Path parameters go through a
+  whitelist (no traversal), passwords and tokens use constant-time comparison, login is
+  rate-limited with backoff.
+- **A new data source = one more object** — the claude / codex differences (scan, locate,
+  parse, staleness stamp) are collapsed into a `SOURCES` adapter table; the main flow is
+  source-agnostic. Frontend tool rendering is a registry the same way.
+
 ## Security
 
 - Login issues an HMAC-signed session cookie (`HttpOnly`, `SameSite=Lax`, `Secure`, 7-day TTL)
