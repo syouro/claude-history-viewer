@@ -31,6 +31,7 @@ pm2 restart claude-history   # after code changes
 - **Paged loading** — a session opens with its latest 80 messages, viewed from the bottom; scrolling up loads earlier messages on demand
 - **Live tracking** — sessions written to within 2 minutes get a pulsing “in progress” badge; an open session polls for new messages and appends them incrementally, auto-following when you are at the bottom
 - **tmux bridge** (optional, off by default) — remote-control a running Claude Code from your phone. The backend captures the terminal and parses it into an interaction state; the frontend renders native controls: send a message, tap to answer a permission/choice prompt, <kbd>Esc</kbd> to interrupt, <kbd>⇧⇥</kbd> to cycle permission modes (the button shows the current mode). A ▣ console lists panes, shows a raw ANSI terminal as a fallback, and can create / kill sessions from the web. See the dedicated section below
+- **Multiple agent CLIs** — besides Claude Code, sidebar tabs for **Codex** (`~/.codex/sessions`) and **Agy** (Google Antigravity CLI, `~/.gemini/antigravity-cli`) history: the same list / search / stats / favorites / sharing / export / delete, with tool-aware rendering per CLI. Each tab appears automatically when its directory exists. (Agy transcripts carry no token usage, and long compacted conversations may be missing their beginning)
 - **Subagent sidechains** — `<sessionId>/subagents/agent-*.jsonl` files are parsed separately; chips above the conversation switch between the main thread and each subagent
 - **Compaction awareness** — `summary` lines, `isCompactSummary` messages, and `compact_boundary` markers render as a summary banner, a collapsible block, and a divider respectively
 - **Tool-aware rendering** — Bash shows the command, Read/Write/Edit show file paths, Edit renders a red/green diff, todo lists / questions / subagent calls get structured cards; unknown tools fall back to JSON
@@ -125,9 +126,9 @@ SECURE_COOKIE=0 COOKIE_PATH=/ PORT=48999 node server.js
   off by default, login-only, with a whitelist for named keys. Path parameters go through a
   whitelist (no traversal), passwords and tokens use constant-time comparison, login is
   rate-limited with backoff.
-- **A new data source = one more object** — the claude / codex differences (scan, locate,
-  parse, staleness stamp) are collapsed into a `SOURCES` adapter table; the main flow is
-  source-agnostic. Frontend tool rendering is a registry the same way.
+- **A new data source = one more object** — the claude / codex / agy differences (scan,
+  locate, parse, staleness stamp) are collapsed into a `SOURCES` adapter table; the main
+  flow is source-agnostic. Frontend tool rendering is a registry the same way.
 
 ## Security
 

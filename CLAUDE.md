@@ -52,6 +52,26 @@
   codex 无项目目录，项目名由 cwd 编码（`codexProject()`，与前端 `encCwd` 同款）。
 - 会话标题优先取 `~/.codex/session_index.jsonl` 的 thread_name，缺省用首条用户消息。
 
+## agy 数据源（Antigravity CLI，第三个页签）
+
+- 根目录 `agyRoots`（默认 `~/.gemini/antigravity-cli`，目录存在即启用，`"agy": false` 强关，
+  env `AGY_DIR` 覆盖）；索引键 `agy:<uuid>`。
+- **主存储读不动**：`conversations/<uuid>.db` 是 SQLite、步骤是 protobuf blob（老会话 `.pb`），
+  零依赖下不去碰；解析走 `brain/<uuid>/.system_generated/logs/transcript_full.jsonl`
+  （CLI 同步导出的 JSONL，退回 `transcript.jsonl`）。已知局限：**没有 token 用量**（usage 恒零）、
+  被压缩过的超长会话可能缺开头（有 CHECKPOINT 条目）、个别会话没有 transcript。
+- `parseAgySession()` 的坑：
+  - USER_INPUT 的正文包在 `<USER_REQUEST>` 里，其余（ADDITIONAL_METADATA /
+    USER_SETTINGS_CHANGE…）是环境注入，没包裹的按 isMeta 隐藏；模型名只能从
+    `Model Selection` 设置变更句里挖（名字带点如 `Gemini 3.5`，截断要认「句号+空白」）；
+  - PLANNER_RESPONSE 带 `thinking` / `content` / `tool_calls[]`（args 大驼峰：AbsolutePath、
+    CommandLine…，前端按名字 reg 了 view_file / run_command / replace_file_content 等）；
+  - 其余类型（VIEW_FILE / RUN_COMMAND / CODE_ACTION…）是工具执行步骤，content 即结果，
+    开头两行 `Created At:/Completed At:` 剥掉；错误看 `error` / `exit_code`。
+- workspace（→ 项目名，编码同 codexProject）与起止时间来自根下 `history.jsonl`
+  （每条用户输入 {display, timestamp, workspace, conversationId}，`agyMeta()` 按 mtime 缓存）。
+- 删除 = 整个 `brain/<uuid>` 目录 + `conversations/<uuid>.db|.pb` 一起删。
+
 ## tmux 桥接（网页控制台）
 
 - 默认关闭；config.json `"tmux": true` 或 `TMUX_UI=1` 开启（不叫 TMUX：tmux 会注入同名变量）。

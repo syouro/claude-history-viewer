@@ -55,6 +55,14 @@ const CODEX_ROOTS = (process.env.CODEX_SESSIONS_DIR
   .map((p) => path.resolve(expandHome(String(p))));
 const CODEX_ENABLED = USER_CFG.codex !== undefined ? !!USER_CFG.codex
   : CODEX_ROOTS.some((r) => fs.existsSync(r));
+// agy（Antigravity CLI）会话历史（~/.gemini/antigravity-cli）：目录存在即启用，"agy": false 强关
+const AGY_ROOTS = (process.env.AGY_DIR
+  ? [process.env.AGY_DIR]
+  : (Array.isArray(USER_CFG.agyRoots) && USER_CFG.agyRoots.length
+      ? USER_CFG.agyRoots : ['~/.gemini/antigravity-cli']))
+  .map((p) => path.resolve(expandHome(String(p))));
+const AGY_ENABLED = USER_CFG.agy !== undefined ? !!USER_CFG.agy
+  : AGY_ROOTS.some((r) => fs.existsSync(r));
 
 // ---------- 配置 / 密钥（persist 到 secret.json）----------
 const CFG = path.join(__dirname, 'secret.json');
@@ -519,6 +527,146 @@ function parseCodexSession(id, filePath) {
   };
 }
 
+// ---------- agy（Antigravity CLI）会话解析 ----------
+// 主存储是 conversations/<uuid>.db（SQLite，步骤还是 protobuf blob），零依赖读不动；
+// 用 brain/<uuid>/.system_generated/logs/transcript_full.jsonl（CLI 同步导出的 JSONL）。
+// 局限：被压缩过的老会话 transcript 可能缺开头（有 CHECKPOINT 标记），个别会话没有 transcript；
+// transcript 里没有 token 用量，usage 恒为零。工作区 / 起止时间来自根下 history.jsonl。
+const AGY_ID_RE = /^[0-9a-f-]{36}$/i;
+function agyFile(id) {
+  if (!AGY_ID_RE.test(id || '')) return null;
+  for (const root of AGY_ROOTS) {
+    const dir = path.join(root, 'brain', id, '.system_generated', 'logs');
+    for (const name of ['transcript_full.jsonl', 'transcript.jsonl']) {
+      const fp = path.join(dir, name);
+      if (fs.existsSync(fp)) return fp;
+    }
+  }
+  return null;
+}
+function agyProject(cwd) { return cwd ? codexProject(cwd) : 'agy'; }
+// history.jsonl：每条用户输入 {display, timestamp, workspace, conversationId}，
+// 聚合成 conversationId → {workspace, firstTs, lastTs}；mtime 变了才重读
+let agyMetaCache = { stamp: '', map: new Map() };
+function agyMeta() {
+  let stamp = '';
+  const files = AGY_ROOTS.map((r) => path.join(r, 'history.jsonl'));
+  for (const fp of files) {
+    try { stamp += fp + ':' + fs.statSync(fp).mtimeMs + ';'; } catch { /* 无历史 */ }
+  }
+  if (stamp === agyMetaCache.stamp) return agyMetaCache.map;
+  const map = new Map();
+  for (const fp of files) {
+    let raw = '';
+    try { raw = fs.readFileSync(fp, 'utf8'); } catch { continue; }
+    for (const line of raw.split('\n')) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        const o = JSON.parse(s);
+        if (!o.conversationId) continue;
+        const m = map.get(o.conversationId) || {};
+        if (o.workspace && !m.workspace) m.workspace = o.workspace;
+        if (o.timestamp) {
+          if (!m.firstTs) m.firstTs = o.timestamp;
+          m.lastTs = o.timestamp;
+        }
+        map.set(o.conversationId, m);
+      } catch { /* skip */ }
+    }
+  }
+  agyMetaCache = { stamp, map };
+  return map;
+}
+function parseAgySession(id, filePath) {
+  const stat = fs.statSync(filePath);
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const messages = [];
+  let model = '', firstPrompt = '';
+  let firstTs = null, lastTs = null;
+  const msgsByDay = {};
+  const push = (role, ts, isMeta, blocks, extra) => {
+    if (!blocks.length) return;
+    if (ts) { if (!firstTs) firstTs = ts; lastTs = ts; }
+    const day = ts ? String(ts).slice(0, 10) : '';
+    msgsByDay[day] = (msgsByDay[day] || 0) + 1;
+    messages.push(Object.assign({ role, ts, isMeta, blocks }, extra));
+  };
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    let o;
+    try { o = JSON.parse(s); } catch { continue; }
+    const ts = o.created_at || null;
+    switch (o.type) {
+      case 'USER_INPUT': {
+        const c = String(o.content || '');
+        // 正文在 <USER_REQUEST> 里；其余包裹（ADDITIONAL_METADATA / USER_SETTINGS_CHANGE…）
+        // 是环境注入。模型名顺带从设置变更记录里挖出来（transcript 没有别的模型字段）
+        const m = c.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+        // 模型名里有点（Gemini 3.5），到「句号+空白 / 行尾」才截断
+        const sm = c.match(/`Model Selection` from [^\n]*? to (.*?)(?:\.\s|\.$|\n|$)/);
+        if (sm) model = sm[1].trim();
+        const text = (m ? m[1] : c).trim();
+        if (!text) break;
+        if (!firstPrompt && m) firstPrompt = text.slice(0, 200);
+        push('user', ts, !m, [{ kind: 'text', text }]);
+        break;
+      }
+      case 'PLANNER_RESPONSE': {
+        const blocks = [];
+        if (o.thinking) blocks.push({ kind: 'thinking', text: String(o.thinking) });
+        const text = String(o.content || '').trim();
+        if (text) blocks.push({ kind: 'text', text });
+        for (const tc of Array.isArray(o.tool_calls) ? o.tool_calls : [])
+          blocks.push({ kind: 'tool_use', name: (tc && tc.name) || 'tool', input: (tc && tc.args) || {} });
+        push('assistant', ts, false, blocks);
+        break;
+      }
+      case 'CHECKPOINT':
+        push('system', ts, false,
+          [{ kind: 'compact', text: '—— 上下文已压缩，此处之前的内容被摘要替代 ——' }]);
+        break;
+      case 'CONVERSATION_HISTORY': { // 续接注入的整段历史：多数为空；有内容就折叠收起
+        const text = String(o.content || '').trim();
+        if (text) push('user', ts, true, [{ kind: 'text', text }], { compact: true });
+        break;
+      }
+      case 'ERROR_MESSAGE':
+        push('system', ts, false,
+          [{ kind: 'text', text: '⚠ ' + String(o.error || o.content || '').trim() }]);
+        break;
+      case 'SYSTEM_MESSAGE': { // 系统注入的提示，按 meta 隐藏
+        const text = String(o.content || '').trim();
+        if (text) push('user', ts, true, [{ kind: 'text', text }]);
+        break;
+      }
+      default: { // 其余都是工具执行步骤（VIEW_FILE / RUN_COMMAND / CODE_ACTION…），content 即结果
+        if (!o.type) break;
+        let text = String(o.content || '')
+          .replace(/^Created At:[^\n]*\n?/, '').replace(/^Completed At:[^\n]*\n?/, '').trim();
+        const isError = !!o.error ||
+          (o.exit_code !== undefined && o.exit_code !== null && o.exit_code !== 0);
+        if (o.error) text = (text ? text + '\n' : '') + '⚠ ' + String(o.error).trim();
+        if (text) push('user', ts, false, [{ kind: 'tool_result', text, isError }]);
+        break;
+      }
+    }
+  }
+  const meta = agyMeta().get(id) || {};
+  const cwd = meta.workspace || '';
+  if (!firstTs && meta.firstTs) firstTs = new Date(meta.firstTs).toISOString();
+  if (!lastTs && meta.lastTs) lastTs = new Date(meta.lastTs).toISOString();
+  return {
+    project: agyProject(cwd), id, src: 'agy', threadSource: '',
+    title: firstPrompt || '(无标题)', firstPrompt,
+    cwd, gitBranch: '', agentName: '', mtime: stat.mtimeMs, firstTs, lastTs,
+    lastModel: model, msgCount: messages.length, summaries: [],
+    usage: zeroU(), usageByDay: {}, msgsByDay,
+    sidechains: [], messages,
+  };
+}
+
 // 子代理文件的变化也要让缓存失效：取全部相关文件 mtime 拼校验戳
 function cacheStamp(filePath) {
   let stamp = String(fs.statSync(filePath).mtimeMs);
@@ -630,6 +778,37 @@ const SOURCES = {
     listable: (s) => s.threadSource !== 'subagent',
     remove(fp) {
       try { fs.unlinkSync(fp); } catch { return false; }
+      return true;
+    },
+  },
+  agy: {
+    enabled: AGY_ENABLED,
+    key: (project, id) => 'agy:' + id, // uuid 全局唯一，项目名（workspace 推导）不进键
+    scan(visit) { // brain/<uuid>/.system_generated/logs/transcript(_full).jsonl
+      for (const root of AGY_ROOTS) {
+        let ids;
+        try { ids = fs.readdirSync(path.join(root, 'brain')); } catch { continue; }
+        for (const id of ids) {
+          if (!AGY_ID_RE.test(id) || !NAME_RE.test(id)) continue;
+          const fp = agyFile(id);
+          if (fp) visit(null, id, fp);
+        }
+      }
+    },
+    locate: (project, id) => agyFile(id),
+    stamp: (fp) => String(fs.statSync(fp).mtimeMs),
+    parse: (project, id, fp) => parseAgySession(id, fp),
+    listable: () => true,
+    remove(fp) { // 删除整个 brain/<id> 目录，连带主存储 conversations/<id>.db|.pb
+      const bdir = path.dirname(path.dirname(path.dirname(fp)));
+      const id = path.basename(bdir);
+      if (!AGY_ID_RE.test(id)) return false;
+      try { fs.rmSync(bdir, { recursive: true, force: true }); } catch { return false; }
+      for (const root of AGY_ROOTS) {
+        for (const ext of ['.db', '.pb']) {
+          try { fs.unlinkSync(path.join(root, 'conversations', id + ext)); } catch { /* 不存在 */ }
+        }
+      }
       return true;
     },
   },
@@ -1097,7 +1276,10 @@ const server = http.createServer(async (req, res) => {
       res.end(fs.readFileSync(APP_JS));
       return;
     }
-    if (p === '/api/me') { sendJSON(res, { authed: isAuthed(req), codex: CODEX_ENABLED }); return; }
+    if (p === '/api/me') {
+      sendJSON(res, { authed: isAuthed(req), codex: CODEX_ENABLED, agy: AGY_ENABLED });
+      return;
+    }
     if (p === '/api/login' && req.method === 'POST') {
       const ip = clientIp(req);
       const lock = checkLock(ip);
@@ -1186,7 +1368,8 @@ const server = http.createServer(async (req, res) => {
       const days = Math.min(30, Math.max(1, +body.days || 7));
       const exp = Date.now() + days * 86400e3;
       const tok = { sp: body.project, si: body.id, exp };
-      if (srcOf(body.src) === 'codex') tok.sr = 'codex';
+      const bsrc = srcOf(body.src);
+      if (bsrc !== 'claude') tok.sr = bsrc; // 非 claude 源进 token，跨源冒充会被拒
       sendJSON(res, { token: signToken(tok), exp });
       return;
     }
@@ -1382,7 +1565,8 @@ const server = http.createServer(async (req, res) => {
 // 供 node:test 复用纯函数（被 require 时不启动服务器）
 module.exports = {
   globToRe, isExcluded, extractBlocks, toolResultText, plainText,
-  priceFor, costOf, parseSession, parseCodexSession, codexProject, searchBlobs, indexEntry,
+  priceFor, costOf, parseSession, parseCodexSession, codexProject, parseAgySession, agyProject,
+  searchBlobs, indexEntry,
   refreshIndex, listAll, search, loadSession, deleteSession, summary, INDEX,
   saveIndex, saveBlobs, // 供测试强制落盘（生产走 3s 防抖）
   stripAnsi, paneState, // tmux 桥接的纯函数
@@ -1396,6 +1580,7 @@ if (require.main === module) {
     if (EXCLUDE.length) console.log('  排除规则：' + (USER_CFG.exclude || []).join('，'));
     console.log('  tmux 桥接：' + (TMUX_UI ? '已开启（网页可向 tmux 会话发送按键）' : '未开启'));
     console.log('  codex 历史：' + (CODEX_ENABLED ? CODEX_ROOTS.join('，') : '未启用'));
+    console.log('  agy 历史：' + (AGY_ENABLED ? AGY_ROOTS.join('，') : '未启用'));
     if (generated) {
       console.log('\n  ⚠ 已生成随机登录密码（也写入 secret.json）：');
       console.log('      ' + generated + '\n');
@@ -1768,7 +1953,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
         <button class="iconbtn" id="logout" title="退出登录">⏻</button>
       </div>
     </div>
-    <div id="srctabs"><button data-s="claude" class="on">Claude</button><button data-s="codex">Codex</button></div>
+    <div id="srctabs"><button data-s="claude" class="on">Claude</button><button data-s="codex">Codex</button><button data-s="agy">Agy</button></div>
     <input id="q" placeholder="模糊搜索标题 / 内容…" autocomplete="off">
     <div class="filters">
       <select id="fproj"><option value="">全部项目</option></select>

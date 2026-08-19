@@ -2,12 +2,16 @@
 var $ = function (s) { return document.querySelector(s); };
 var sessions = [], current = null, searchMode = false, lastTerms = [], favs = {};
 var SHARE = new URLSearchParams(location.search).get('share'); // 访客只读模式
-// 数据源：claude / codex 两页独立（列表、搜索、统计互不混）。收藏键与后端 keyOf 对齐
-var SRC = localStorage.getItem('chv-src') === 'codex' ? 'codex' : 'claude';
-var CODEX_ON = false;
+// 数据源：claude / codex / agy 各自一页（列表、搜索、统计互不混）。收藏键与后端 keyOf 对齐
+var SRCS = ['claude', 'codex', 'agy'];
+var SRC = SRCS.indexOf(localStorage.getItem('chv-src')) >= 0
+  ? localStorage.getItem('chv-src') : 'claude';
+var SRC_ON = { claude: true, codex: false, agy: false }; // 由 /api/me 回填
 function bySrc(arr) { return arr.filter(function (s) { return (s.src || 'claude') === SRC; }); }
-function aiName(src) { return src === 'codex' ? 'Codex' : 'Claude'; }
-function favKey(s) { return s.src === 'codex' ? 'codex:' + s.id : s.project + '/' + s.id; }
+function aiName(src) { return src === 'codex' ? 'Codex' : src === 'agy' ? 'Agy' : 'Claude'; }
+function favKey(s) {
+  return s.src && s.src !== 'claude' ? s.src + ':' + s.id : s.project + '/' + s.id;
+}
 function shareQ() { return SHARE ? '&share=' + encodeURIComponent(SHARE) : ''; }
 var PAGE = 80; // 每次加载的消息条数
 
@@ -357,7 +361,8 @@ async function open(s, jumpIdx) {
   bindComposer(data);
   document.body.classList.remove('nav-open'); // 移动端选完会话收起抽屉
   if (jumpIdx != null) jumpToMsg(jumpIdx);
-  history.replaceState(null, '', '#s=' + (data.src === 'codex' ? 'codex:' : '') +
+  history.replaceState(null, '', '#s=' +
+    (data.src && data.src !== 'claude' ? data.src + ':' : '') +
     encodeURIComponent(data.project) + '/' +
     encodeURIComponent(data.id) + (jumpIdx != null ? '/' + jumpIdx : ''));
   scheduleLive();
@@ -370,11 +375,11 @@ function jumpToMsg(idx) {
   el.classList.add('flash');
   setTimeout(function () { el.classList.remove('flash'); }, 2000);
 }
-// #s=[codex:]项目/会话ID[/消息序号] 直达定位
+// #s=[codex:|agy:]项目/会话ID[/消息序号] 直达定位
 function navFromHash() {
-  var m = location.hash.match(/^#s=(codex:)?([^/]+)\/([^/]+)(?:\/(\d+))?$/);
+  var m = location.hash.match(/^#s=(codex:|agy:)?([^/]+)\/([^/]+)(?:\/(\d+))?$/);
   if (!m) return;
-  var s = { src: m[1] ? 'codex' : 'claude',
+  var s = { src: m[1] ? m[1].slice(0, -1) : 'claude',
     project: decodeURIComponent(m[2]), id: decodeURIComponent(m[3]) };
   var idx = m[4] === undefined ? null : +m[4];
   if (current && current.project === s.project && current.id === s.id && idx != null &&
@@ -444,7 +449,7 @@ $('#share').onclick = async function () {
   var j = await r.json();
   if (!j.token) return;
   var link = location.origin + location.pathname + '?share=' + encodeURIComponent(j.token) +
-    '#s=' + (current.src === 'codex' ? 'codex:' : '') +
+    '#s=' + (current.src && current.src !== 'claude' ? current.src + ':' : '') +
     encodeURIComponent(current.project) + '/' + encodeURIComponent(current.id);
   var note = '只读链接（' + new Date(j.exp).toLocaleDateString('zh-CN') + ' 过期）：';
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -685,6 +690,37 @@ reg('web_search', null, function (i) { // codex 的联网搜索（input 是 acti
   return { sum: '🌐 web_search' +
     (i.query || i.type ? ' · ' + esc(clip(i.query || i.type, 70)) : '') };
 });
+// agy（Antigravity CLI）的工具：args 是大驼峰字段，附带的 toolAction/toolSummary 是给
+// CLI 状态行的提示语，不用专门展示（通用 JSON body 里能看到）
+reg('view_file', function (i) { return i.AbsolutePath; }, function (i) {
+  return { sum: '📖 view_file · ' + esc(shortPath(i.AbsolutePath)) };
+});
+reg('list_dir', function (i) { return i.DirectoryPath; }, function (i) {
+  return { sum: '📁 list_dir · ' + esc(shortPath(i.DirectoryPath)) };
+});
+reg('run_command', function (i) { return i.CommandLine; }, function (i, t) {
+  return shellView(i.CommandLine, i.Cwd ? 'cwd ' + i.Cwd : '', t);
+});
+reg('grep_search', function (i) { return i.Query; }, function (i, t) {
+  return { sum: '🔍 grep_search · ' + esc(clip(i.Query, 60)) +
+    (i.SearchPath ? ' <span class="dim">' + esc(shortPath(i.SearchPath)) + '</span>' : '') };
+});
+reg('search_web', function (i) { return i.query; }, function (i) {
+  return { sum: '🌐 search_web · ' + esc(clip(i.query, 70)) };
+});
+reg('read_url_content', function (i) { return i.Url || i.url; }, function (i) {
+  return { sum: '🌐 read_url_content · ' + esc(clip(i.Url || i.url, 70)) };
+});
+reg('write_to_file', function (i) { return i.CodeContent !== undefined; }, function (i, t) {
+  return { sum: '📝 write_to_file · ' + esc(shortPath(i.TargetFile || i.AbsolutePath || '')),
+    body: bodyDiv(hi(String(i.CodeContent || '').slice(0, 20000), t)) };
+});
+reg('replace_file_content', function (i) { return i.ReplacementContent !== undefined; },
+  function (i, t) {
+    return { sum: '✏️ replace_file_content · ' + esc(shortPath(i.TargetFile || '')) +
+      (i.Description ? ' · ' + esc(clip(i.Description, 50)) : ''),
+      body: diffBody(i.TargetContent || '', i.ReplacementContent, t) };
+  });
 reg('Task Agent', function (i) { return i.prompt || i.description; }, function (i, t, name) {
   return { sum: '🤖 ' + esc(name) + (i.subagent_type ? ' · ' + esc(i.subagent_type) : '') +
     ' · ' + esc(clip(i.description || '', 50)),
@@ -1407,10 +1443,12 @@ async function pollPane(t) {
   paneTimer = setTimeout(function () { pollPane(t); }, paneDelay());
 }
 
-// ---------- 数据源切换（Claude / Codex 两页独立） ----------
+// ---------- 数据源切换（Claude / Codex / Agy 各自一页） ----------
 function syncSrcUI() {
-  $('#srctabs').style.display = CODEX_ON ? 'flex' : 'none';
+  // 有任一附加源才显示页签条；没启用的源藏掉自己的按钮
+  $('#srctabs').style.display = (SRC_ON.codex || SRC_ON.agy) ? 'flex' : 'none';
   document.querySelectorAll('#srctabs button').forEach(function (b) {
+    b.style.display = SRC_ON[b.dataset.s] ? '' : 'none';
     b.classList.toggle('on', b.dataset.s === SRC);
   });
   $('#side h1').innerHTML = '<span class="dot"></span>' + aiName(SRC) + ' 对话历史';
@@ -1542,8 +1580,8 @@ $('#logout').onclick = async function () { await fetch('api/logout'); showLogin(
 initTheme();
 (async function () {
   var me = await (await fetch('api/me')).json();
-  CODEX_ON = !!me.codex;
-  if (!CODEX_ON && SRC === 'codex') SRC = 'claude'; // codex 关掉后别卡在空页
+  SRC_ON.codex = !!me.codex; SRC_ON.agy = !!me.agy;
+  if (!SRC_ON[SRC]) SRC = 'claude'; // 当前源被关掉后别卡在空页
   if (me.authed) showApp();
   else if (SHARE) showShareView();
   else showLogin();
