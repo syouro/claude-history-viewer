@@ -1179,15 +1179,32 @@ function updateCState(st) {
   if (st.kind === 'menu') {
     if (st.question) h += '<div class="cq">' + esc(st.question) + '</div>';
     h += '<div class="copts">' + st.options.map(function (o) {
-      return '<button class="copt' + (o.sel ? ' sel' : '') + '" data-n="' + o.n + '"><b>' +
-        o.n + '</b>' + esc(o.label) + '</button>';
+      return '<button class="copt' + (o.sel ? ' sel' : '') + '" data-n="' +
+        (st.nav ? o.i : o.n) + '">' + (st.nav ? '' : '<b>' + o.n + '</b>') + esc(o.label) +
+        (o.desc ? '<small>' + esc(o.desc) + '</small>' : '') + '</button>';
     }).join('') + '</div>';
   } else if (st.kind === 'busy') {
     h = '<div class="cbusy">✻ 正在干活…（Esc 可打断，这时发的消息会排队）</div>';
   }
   el.innerHTML = h;
   el.querySelectorAll('.copt').forEach(function (b) {
-    b.onclick = function () { b.disabled = true; sendTmux({ text: String(b.dataset.n) }); };
+    b.onclick = function () {
+      b.disabled = true;
+      if (st.nav) {
+        // 无编号菜单（agy 信任框 / 模型选择器等）：按数字无效，换算成 ↑/↓ 步数 + 回车
+        var cur = 0;
+        st.options.forEach(function (o) { if (o.sel) cur = o.i; });
+        var d = (+b.dataset.n) - cur, keys = [];
+        for (var k = 0; k < Math.abs(d); k++) keys.push(d > 0 ? 'Down' : 'Up');
+        keys.push('Enter');
+        sendTmux({ keys: keys });
+        return;
+      }
+      // codex 的菜单按数字只移动光标，要补一个回车确认（st.enter 由后端从提示行识别）
+      var p = { text: String(b.dataset.n) };
+      if (st.enter) p.keys = ['Enter'];
+      sendTmux(p);
+    };
   });
 }
 async function sendTmux(payload) {

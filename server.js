@@ -944,7 +944,7 @@ async function tmuxPanes() {
     const [id, session, win, winName, paneIdx, cmd, cwd, active, w, h] = l.split('\u241f');
     return { id, session, win: +win, winName, paneIdx: +paneIdx, cmd, cwd,
       active: active === '1', w: +w, h: +h,
-      claude: /^(claude|codex|node|bun)$/.test(cmd) }; // agent CLI 的进程名可能是 node/bun
+      claude: /^(claude|codex|agy|gemini|node|bun)$/.test(cmd) }; // agent CLI 的进程名可能是 node/bun
   });
 }
 // 去掉 ANSI 转义（SGR / 光标控制 / OSC 标题等），留纯文本供状态解析
@@ -973,34 +973,87 @@ function paneState(raw) {
       /(manual mode|auto-accept|accept edits|plan mode|bypass(?:ing)? permissions|auto mode)/i);
     if (m) { mode = m[1].toLowerCase(); break; }
   }
-  // 找可见区里最后一个连续的「❯ 1. xxx / 2. xxx」编号选项块。
-  // 不能要求贴着底部：块下方常有提示行（Esc to cancel · Tab to amend…）/ 状态栏。
-  const OPT_RE = /^\s*(❯\s*)?(\d+)[.)]\s+(.+)$/;
+  // 找可见区里最后一个「(❯|›|>) 1. xxx」编号选项块（❯ Claude / › codex / > agy 的光标）。
+  // 不能要求贴着底部：块下方常有提示行（Esc to cancel · Press enter to confirm…）/ 状态栏。
+  const OPT_RE = /^\s*([>❯›]\s*)?(\d+)[.)]\s+(.+)$/;
+  const BORDER_RE = /^[─╌╭╮╰╯]+$/;
   let end = -1;
   for (let k = tail.length - 1; k >= 0; k--) {
     if (OPT_RE.test(tail[k])) { end = k; break; }
   }
   if (end >= 0) {
-    let start = end;
-    while (start > 0 && OPT_RE.test(tail[start - 1])) start--;
-    const opts = tail.slice(start, end + 1).map((l) => {
-      const m = l.match(OPT_RE);
-      return { n: +m[2], label: m[3].trim(), sel: !!m[1] };
-    });
-    // 序号必须从 1 连续递增、且带 ❯ 光标，才认为是菜单（避免把正文里的有序列表当菜单）
-    if (opts.length >= 2 && opts.every((o, k) => o.n === k + 1) && opts.some((o) => o.sel)) {
+    // 自底向上收集编号行。选项之间允许夹少量非编号行（AskUserQuestion 的选项描述、
+    // codex 右列描述换出的续行、分隔线），夹行归属其上方最近的选项当 desc。
+    const opts = [];
+    let start = end, gap = 0, pend = [];
+    for (let k = end; k >= 0; k--) {
+      const m = tail[k].match(OPT_RE);
+      if (!m) {
+        if (++gap > 3) break;
+        const t = tail[k].trim();
+        if (t && !BORDER_RE.test(t)) pend.unshift(t);
+        continue;
+      }
+      if (opts.length && +m[2] !== opts[0].n - 1) break; // 序号不衔接 → 上面是别的列表
+      gap = 0; start = k;
+      // codex 把选项描述放同行右侧（空格对齐的右列，列距最窄 2 空格），与下方续行一起归入 desc
+      const parts = m[3].trim().split(/\s{2,}/);
+      const desc = parts.slice(1).concat(pend).join(' ');
+      pend = [];
+      opts.unshift({ n: +m[2], label: parts[0], sel: !!m[1], ...(desc ? { desc } : {}) });
+      if (+m[2] === 1) break;
+    }
+    // 序号必须从 1 连续递增、且恰有一行带光标，才认为是菜单
+    // （避免把正文里的有序列表、markdown 引用块里的列表当菜单）
+    if (opts.length >= 2 && opts[0].n === 1 && opts.filter((o) => o.sel).length === 1) {
       let question = '';
       for (let k = start - 1; k >= 0; k--) { // 往上找最近的非空行当问题（跳过边框线）
+        const t = tail[k].trim();
+        if (!t || BORDER_RE.test(t)) continue;
+        question = t; break;
+      }
+      // codex 的菜单按数字只移动光标，得再回车确认；从块下方的提示行识别这形态
+      const enter =
+        /press enter to (confirm|continue|select)/i.test(tail.slice(end + 1).join('\n'));
+      return { kind: 'menu', question, options: opts, mode, ...(enter ? { enter: true } : {}) };
+    }
+  }
+  // 无编号的光标菜单（agy 的信任对话框 / 模型选择器等）：只能 ↑/↓ 移动 + 回车确认。
+  // 锚点是「↑/↓ …」提示行，从它往上收连续的选项行；点选由前端换算成方向键（nav 标记）。
+  const hint = tail.map((l) => /↑\/↓/.test(l)).lastIndexOf(true);
+  if (hint > 0 && hint >= tail.length - 12) { // 提示行必须贴近底部，防止正文里的 ↑/↓ 误触发
+    const opts = [];
+    let start = hint, gap = 0;
+    for (let k = hint - 1; k >= 0 && opts.length <= 20; k--) {
+      const l = tail[k];
+      // 块内的空行 / 滑杆等装饰行 / 深缩进的说明行可跳过（连跳有上限）
+      if (!l.trim() || /[━◂▸◉]/.test(l) || /^\s{4,}/.test(l)) {
+        if (++gap > 5) break;
+        continue;
+      }
+      const m = l.match(/^(?:([>❯›])\s+|\s{2,3})(\S.*)$/);
+      if (!m) break; // 边框 / 顶格标题 → 选项块到头
+      gap = 0; start = k;
+      const parts = m[2].trim().split(/\s{2,}/); // 右列备注（(current) 等）拆进 desc
+      opts.unshift({ label: parts[0], sel: !!m[1],
+        ...(parts.length > 1 ? { desc: parts.slice(1).join(' ') } : {}) });
+    }
+    // 恰有一行光标、至少两个选项才算（防把普通缩进文本认成菜单）
+    if (opts.length >= 2 && opts.filter((o) => o.sel).length === 1) {
+      opts.forEach((o, k) => { o.i = k; });
+      let question = '';
+      for (let k = start - 1; k >= 0; k--) {
         const t = tail[k].trim();
         if (!t || /^[─╌╭╮╰╯]+$/.test(t)) continue;
         question = t; break;
       }
-      return { kind: 'menu', question, options: opts, mode };
+      return { kind: 'menu', question, options: opts, mode, nav: true };
     }
   }
-  if (busy) return { kind: 'busy', mode };
+  // agy 干活时输入框还挂在屏上，得先靠盲文点阵转轮（⣯ Generating… 之类）认出 busy
+  if (busy || tail.some((l) => /^\s*[⠀-⣿]+\s+\S/.test(l))) return { kind: 'busy', mode };
   for (let k = tail.length - 1; k >= Math.max(0, tail.length - 8); k--) {
-    if (/^[>❯]$/.test(tail[k]) || /^[>❯]\s/.test(tail[k])) return { kind: 'idle', mode }; // 底部的输入提示符
+    if (/^[>❯›]$/.test(tail[k]) || /^[>❯›]\s/.test(tail[k])) return { kind: 'idle', mode }; // 底部的输入提示符
   }
   return { kind: 'unknown', mode };
 }
@@ -1234,9 +1287,13 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(lines)) lines = 200;
       lines = Math.max(50, Math.min(2000, lines));
       try {
+        // 状态解析只看可见屏幕：带滚回历史的话，翻上去的旧菜单（codex 的更新提示等）
+        // 会被误认成还挂着；滚回内容只用于裸终端展示
+        const vis = await tmux(['capture-pane', '-p', '-e', '-t', t]);
+        const state = paneState(vis);
+        if (url.searchParams.get('lite') === '1') { sendJSON(res, { state }); return; }
         const text = await tmux(['capture-pane', '-p', '-e', '-t', t, '-S', '-' + lines]);
-        const state = paneState(text);
-        sendJSON(res, url.searchParams.get('lite') === '1' ? { state } : { text, state });
+        sendJSON(res, { text, state });
       } catch (e) {
         sendJSON(res, { error: '抓取失败：' + String(e.message || e).split('\n')[0] }, 404);
       }
@@ -1249,7 +1306,8 @@ const server = http.createServer(async (req, res) => {
       const t = String(body.t || '');
       const text = typeof body.text === 'string' ? body.text : '';
       const keys = Array.isArray(body.keys) ? body.keys.map(String) : [];
-      if (!PANE_RE.test(t) || text.length > 10000 || keys.length > 8 ||
+      // 键数上限 24：无编号菜单点选要连发一串 ↑/↓ 再回车（见 paneState 的 nav 菜单）
+      if (!PANE_RE.test(t) || text.length > 10000 || keys.length > 24 ||
           keys.some((k) => !TMUX_KEYS.has(k)) || (!text && !keys.length)) {
         sendJSON(res, { error: 'bad request' }, 400); return;
       }
@@ -1644,6 +1702,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 .copt:hover{border-color:var(--accent)}
 .copt.sel{border-color:var(--accent);background:var(--accent-soft)}
 .copt b{color:var(--accent);margin-right:6px}
+.copt small{display:block;color:var(--muted);font-size:11px;font-weight:400;margin-top:2px}
 .copt:disabled{opacity:.5;cursor:default}
 .cbusy{font-size:12.5px;color:var(--muted)}
 .ctarget{max-width:860px;margin:4px auto 0;font-size:10.5px;color:var(--muted);
