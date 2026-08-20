@@ -82,8 +82,9 @@
   `POST /api/tmux/send`（注入；文本走 `-l` 字面量，具名键过 `TMUX_KEYS` 白名单）、
   `POST /api/tmux/new`（新建会话：会话名过白名单、cwd 必须是已存在目录；启动命令会
   包一层 `; exec $SHELL`，命令退出后落回 shell 而不是会话消失）、`POST /api/tmux/kill`（关窗格）、
-  `POST /api/tmux/resize`（`resize-window -x` 调窗口列宽；手机开裸终端时前端自动按屏宽收窄，
-  桌面不自动动、有「适配屏宽」按钮手动触发；本地终端想恢复自适应用 `resize-window -A`）。
+  `POST /api/tmux/resize`（`resize-window -x/-y` 调窗口宽高；手机开裸终端时前端自动
+  按屏幕宽高适配，桌面不自动动、有「适配屏幕」按钮手动触发；本地终端想恢复自适应用
+  `resize-window -A`）。
 - 会话视图底部 `#composer` 控制条：按 cwd / 项目名匹配到 tmux 窗格才显示（优先 claude 进程）。
 - 解析的坑（都有测试兜着，样本全部来自真实抓屏；覆盖 claude / codex / agy 三家 CLI）：
   - tmux 会把 `-F` 输出里的控制字符转成八进制字面量，分隔符用可打印的 `␟`；

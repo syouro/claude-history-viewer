@@ -1542,17 +1542,23 @@ const server = http.createServer(async (req, res) => {
       catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
       return;
     }
-    if (p === '/api/tmux/resize' && req.method === 'POST') { // 调窗口列宽：手机上让 TUI 按屏宽重排
+    if (p === '/api/tmux/resize' && req.method === 'POST') { // 调窗口尺寸：让 TUI 按网页可视区重排
       if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       const t = String(body.t || '');
-      const x = Math.round(+body.x);
-      if (!PANE_RE.test(t) || !Number.isFinite(x) || x < 20 || x > 500) {
+      const hasX = body.x !== undefined, hasY = body.y !== undefined;
+      const x = Math.round(+body.x), y = Math.round(+body.y);
+      const okX = Number.isFinite(x) && x >= 20 && x <= 500;
+      const okY = Number.isFinite(y) && y >= 5 && y <= 300;
+      if (!PANE_RE.test(t) || (!hasX && !hasY) || (hasX && !okX) || (hasY && !okY)) {
         sendJSON(res, { error: 'bad request' }, 400); return;
       }
+      const args = ['resize-window', '-t', t];
+      if (hasX) args.push('-x', String(x));
+      if (hasY) args.push('-y', String(y));
       // resize-window 会把窗口设成手动尺寸；本地终端再 attach 想恢复自适应：resize-window -A
-      try { await tmux(['resize-window', '-t', t, '-x', String(x)]); sendJSON(res, { ok: true }); }
+      try { await tmux(args); sendJSON(res, { ok: true }); }
       catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
       return;
     }
@@ -1995,6 +2001,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     </div>
     <div class="crow ckeys">
       <button class="ckey" data-k="Escape" title="Esc：打断 / 取消">Esc</button>
+      <button class="ckey" data-k="C-c" title="Ctrl+C：退出程序（Claude Code 要连按两下）">^C</button>
       <button class="ckey" data-k="BTab" title="Shift+Tab：切换权限模式">⇧⇥</button>
       <button class="ckey" data-k="Up" title="↑">↑</button>
       <button class="ckey" data-k="Down" title="↓">↓</button>

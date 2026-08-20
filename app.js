@@ -1349,7 +1349,7 @@ function openPane(pn) {
   $('#conv').innerHTML = '<div class="termwrap"><div class="termbar">' +
     '<button id="tback">← 窗格列表</button><b>' + esc(paneLabel(pn)) + '</b><span>' +
     esc(pn.cmd) + '</span><span class="mono">' + esc(pn.cwd) + '</span>' +
-    '<button id="tfit" title="把 tmux 窗口调成当前屏幕放得下的列数，TUI 会自己重排">适配屏宽</button></div>' +
+    '<button id="tfit" title="把 tmux 窗口调成当前屏幕放得下的列数和行数，TUI 会自己重排">适配屏幕</button></div>' +
     '<div class="termscr" id="termscr"><pre id="termpre"></pre></div>' +
     '<button id="tresume" style="display:none">⏸ 已暂停刷新 · 回到底部</button></div>';
   $('#tback').onclick = openTermList;
@@ -1368,10 +1368,13 @@ function openPane(pn) {
     if (panePend && paneGap(scr) < 20) paneApply();
   });
   $('#tresume').onclick = paneApply;
-  // 窄屏自动收窄 tmux 窗口，免得横着划；桌面不动（本地可能还 attach 着别的终端）
+  // 窄屏自动把 tmux 窗口调成屏幕放得下的宽高，免得横着划、画布又只有一小截；
+  // 桌面不自动动（本地可能还 attach 着别的终端），有「适配屏幕」按钮手动触发
   if (window.matchMedia('(max-width:720px)').matches) {
-    var cols = fitCols();
-    if (cols && Math.abs(pn.w - cols) > 2) fitPane(pn.id, true);
+    var cols = fitCols(), rows = fitRows();
+    if ((cols && Math.abs(pn.w - cols) > 2) || (rows && Math.abs(pn.h - rows) > 2)) {
+      fitPane(pn.id, true);
+    }
   }
   showComposer(pn, 'pane'); // 状态由 pollPane 顺带喂给控制条，不再单独轮询
   paneIdle = 0; paneLast = ''; paneHold = 0; panePend = '';
@@ -1399,17 +1402,37 @@ function fitCols() {
   var pad = 24; // .termscr 左右 padding 12px×2
   return Math.max(20, Math.min(500, Math.floor((scr.clientWidth - pad) / cw)));
 }
+// 量出行高，算 termscr 撑满 max-height 时能放下的行数
+// （框本身没有固定高度、是被内容撑开的，所以量上限而不是量 clientHeight）
+function fitRows() {
+  var scr = $('#termscr'), pre = $('#termpre');
+  if (!scr || !pre) return 0;
+  var probe = document.createElement('span');
+  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre';
+  probe.textContent = new Array(10).join('0\n') + '0'; // 10 行取均值，避免亚像素误差
+  pre.appendChild(probe);
+  var lh = probe.getBoundingClientRect().height / 10;
+  probe.remove();
+  if (!lh) return 0;
+  var maxH = parseFloat(getComputedStyle(scr).maxHeight); // calc(100dvh-…) 解析成 px
+  if (!isFinite(maxH) || maxH <= 0) maxH = window.innerHeight - 240;
+  var pad = 20; // .termscr 上下 padding 10px×2
+  return Math.max(10, Math.min(300, Math.floor((maxH - pad) / lh)));
+}
 async function fitPane(t, quiet) {
-  var cols = fitCols();
-  if (!cols) return;
+  var cols = fitCols(), rows = fitRows();
+  if (!cols && !rows) return;
+  var body = { t: t };
+  if (cols) body.x = cols;
+  if (rows) body.y = rows;
   try {
     var r = await fetch('api/tmux/resize', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ t: t, x: cols })
+      body: JSON.stringify(body)
     });
     var j = await r.json().catch(function () { return {}; });
-    if (!j.ok && !quiet) alert('调宽失败：' + (j.error || r.status));
-  } catch (e) { if (!quiet) alert('调宽失败：' + e); }
+    if (!j.ok && !quiet) alert('调整尺寸失败：' + (j.error || r.status));
+  } catch (e) { if (!quiet) alert('调整尺寸失败：' + e); }
 }
 // 自适应节流：画面在变 1.5s 一抓；连着没变化就逐步退到 6s，一有动静（或发过键）立刻回快档
 var paneIdle = 0, paneLast = '', paneHold = 0, panePend = '';
