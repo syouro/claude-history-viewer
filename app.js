@@ -1279,15 +1279,65 @@ async function bindComposer(data) {
 
 // ---- 终端视图（窗格列表 / 单窗格裸终端）----
 function stopPane() { clearTimeout(paneTimer); paneTimer = null; }
+// 服务器状态条：内存/负载 + 「还能再开几个 agent」（数据来自 /api/tmux/sys）
+function fmtMem(b) {
+  if (!isFinite(b)) return '?';
+  var g = b / 1073741824;
+  return g >= 10 ? Math.round(g) + 'G' : g >= 1 ? g.toFixed(1) + 'G'
+    : Math.round(b / 1048576) + 'M';
+}
+function sysBarHTML(sys) {
+  if (!sys || !sys.mem || !sys.mem.total) return '';
+  var used = sys.mem.total - sys.mem.avail;
+  var pct = Math.max(0, Math.min(100, Math.round(used / sys.mem.total * 100)));
+  var est = sys.est || {}, n = est.canOpen || 0;
+  var cls = n >= 2 ? 'ok' : n === 1 ? 'tight' : 'full';
+  var barCls = pct >= 90 ? ' full' : pct >= 75 ? ' tight' : '';
+  var h = '<div class="sysbar" id="sysbar">' +
+    '<span class="est ' + cls + '">还能再开约 <b>' + n + '</b> 个 agent</span>' +
+    '<span title="每个 agent 按 ' + fmtMem(est.perAgent) +
+    (est.sampled ? '（' + est.sampled + ' 个现有窗格实测中位数）' : '（默认估计值）') +
+    ' 估算，并给系统留了余量"><span class="membar' + barCls + '"><i style="width:' + pct +
+    '%"></i></span>内存 ' + fmtMem(used) + ' / ' + fmtMem(sys.mem.total) +
+    ' · 可用 ' + fmtMem(sys.mem.avail) + '</span>' +
+    '<span>负载 ' + (sys.load && sys.load[0] != null ? sys.load[0].toFixed(2) : '?') +
+    ' · ' + (sys.cpus || '?') + ' 核</span>';
+  if (sys.swap && sys.swap.total) {
+    h += '<span>swap 已用 ' + fmtMem(sys.swap.total - sys.swap.free) + '</span>';
+  }
+  if (sys.disk) h += '<span>磁盘可用 ' + fmtMem(sys.disk.avail) + '</span>';
+  return h + '</div>';
+}
+async function fetchSys() {
+  try {
+    var r = await fetch('api/tmux/sys');
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+// 状态条轮询（复用 paneTimer：切走视图时 stopPane 顺带清掉）
+async function pollSys() {
+  if (view.mode !== 'term') return;
+  if (!document.hidden) {
+    var sys = await fetchSys();
+    var el = $('#sysbar');
+    if (view.mode === 'term' && el && sys && sys.mem) el.outerHTML = sysBarHTML(sys);
+  }
+  if (view.mode === 'term') paneTimer = setTimeout(pollSys, 10000);
+}
 async function openTermList() {
   current = null; view.mode = 'term'; clearTimeout(liveTimer);
   stopPane(); hideComposer();
   $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail(); hideHits();
   await loadTmux();
   if (view.mode !== 'term') return;
+  var sys = TMUX.enabled ? await fetchSys() : null;
+  if (view.mode !== 'term') return;
   var panes = TMUX.panes || [];
   var h = '<div class="wrap"><div class="termbar"><b>tmux 窗格</b><span>' + panes.length +
     ' 个</span><button id="trefresh">刷新</button></div>';
+  // 服务器状态条；拉不到时留个隐形占位，轮询恢复后还能原地补上
+  h += sysBarHTML(sys) || '<div id="sysbar" style="display:none"></div>';
   // 新建会话：目录输入带历史会话 cwd 的联想
   var cwds = {};
   sessions.forEach(function (s) { if (s.cwd) cwds[s.cwd] = 1; });
@@ -1305,7 +1355,10 @@ async function openTermList() {
       esc(paneLabel(pn)) + ' · ' + esc(pn.cmd) +
       (pn.claude ? ' <span class="badge">Claude?</span>' : '') +
       '</div><div class="r"><span class="mono">' + esc(pn.cwd) + '</span><span>' +
-      pn.w + '×' + pn.h + '</span></div>' +
+      pn.w + '×' + pn.h + '</span>' +
+      (sys && sys.paneMem && sys.paneMem[pn.id] > 1048576
+        ? '<span class="pmem" title="窗格进程树的常驻内存">内存 ' +
+          fmtMem(sys.paneMem[pn.id]) + '</span>' : '') + '</div>' +
       '<button class="pkill" data-i="' + i + '" title="关闭窗格（终止其中进程）">✕</button></div>';
   }).join('') + '</div>';
   var conv = $('#conv');
@@ -1341,6 +1394,7 @@ async function openTermList() {
       openTermList();
     };
   });
+  if (TMUX.enabled) paneTimer = setTimeout(pollSys, 10000); // 状态条定时刷新
   render($('#q').value.trim());
 }
 function openPane(pn) {

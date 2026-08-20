@@ -1114,18 +1114,96 @@ function tmux(args) {
 }
 const PANE_FMT = ['#{pane_id}', '#{session_name}', '#{window_index}', '#{window_name}',
   '#{pane_index}', '#{pane_current_command}', '#{pane_current_path}',
-  '#{pane_active}', '#{pane_width}', '#{pane_height}'].join('\u241f'); // ␟：可打印的罕见分隔符（tmux 会把真控制字符转成八进制字面量输出，不能用真正的 US）
+  '#{pane_active}', '#{pane_width}', '#{pane_height}',
+  '#{pane_pid}'].join('\u241f'); // ␟：可打印的罕见分隔符（tmux 会把真控制字符转成八进制字面量输出，不能用真正的 US）
 async function tmuxPanes() {
   let out = '';
   try { out = await tmux(['list-panes', '-a', '-F', PANE_FMT]); }
   catch { return []; } // tmux 未装或无服务 → 空列表
   return out.split('\n').filter(Boolean).map((l) => {
-    const [id, session, win, winName, paneIdx, cmd, cwd, active, w, h] = l.split('\u241f');
+    const [id, session, win, winName, paneIdx, cmd, cwd, active, w, h, pid] = l.split('\u241f');
     return { id, session, win: +win, winName, paneIdx: +paneIdx, cmd, cwd,
-      active: active === '1', w: +w, h: +h,
+      active: active === '1', w: +w, h: +h, pid: +pid || 0,
       claude: /^(claude|codex|agy|gemini|node|bun)$/.test(cmd) }; // agent CLI 的进程名可能是 node/bun
   });
 }
+// ---------- 服务器状态（内存/负载 + 「还能再开几个 agent」估算）----------
+// 全走 /proc（Linux），读不到就退回 os.* 或缺省——只影响状态展示，不影响主功能
+const PAGE_SIZE = 4096; // x86_64/aarch64 Linux 默认页大小；Node 没有 getpagesize
+function parseMeminfo(text) {
+  const o = {};
+  for (const m of String(text).matchAll(/^(\w+):\s+(\d+) kB/gm)) o[m[1]] = m[2] * 1024;
+  return o;
+}
+// /proc/<pid>/stat：comm 在括号里可含空格和括号，从最后一个 ')' 之后按空格数字段
+// （state 是第 0 段 → ppid 第 1 段、rss 第 21 段，rss 单位是页）
+function parseProcStat(line) {
+  const cp = String(line).lastIndexOf(')');
+  if (cp < 0) return null;
+  const f = line.slice(cp + 2).split(' ');
+  return { ppid: +f[1] || 0, rss: (+f[21] || 0) * PAGE_SIZE };
+}
+function readProcs() {
+  const procs = new Map(); // pid -> { ppid, rss }
+  let dirs = [];
+  try { dirs = fs.readdirSync('/proc'); } catch { return procs; }
+  for (const d of dirs) {
+    if (!/^\d+$/.test(d)) continue;
+    try {
+      const st = parseProcStat(fs.readFileSync('/proc/' + d + '/stat', 'utf8'));
+      if (st) procs.set(+d, st);
+    } catch { /* 进程刚退出 */ }
+  }
+  return procs;
+}
+// 进程树 RSS：从 pane_pid 起沿子进程求和（CLI 还会 fork node / rg / shell 等）
+function subtreeRss(procs, pid) {
+  const kids = new Map();
+  for (const [p, st] of procs) {
+    if (!kids.has(st.ppid)) kids.set(st.ppid, []);
+    kids.get(st.ppid).push(p);
+  }
+  let sum = 0;
+  const seen = new Set(), q = [pid];
+  while (q.length) {
+    const p = q.pop();
+    if (seen.has(p) || !procs.has(p)) continue;
+    seen.add(p);
+    sum += procs.get(p).rss;
+    for (const c of kids.get(p) || []) q.push(c);
+  }
+  return sum;
+}
+const DEFAULT_AGENT_RSS = 500 * 1024 * 1024; // 没有现成窗格可测时按 500MB/个 估
+function sysSnapshot(panes) {
+  let mi = {};
+  try { mi = parseMeminfo(fs.readFileSync('/proc/meminfo', 'utf8')); } catch { /* 非 Linux */ }
+  const memTotal = mi.MemTotal || os.totalmem();
+  const memAvail = mi.MemAvailable !== undefined ? mi.MemAvailable : os.freemem();
+  const procs = readProcs();
+  const paneMem = {};
+  for (const pn of panes) if (pn.pid) paneMem[pn.id] = subtreeRss(procs, pn.pid);
+  // 每个 agent 会话的开销：现有 agent 窗格进程树 RSS 的中位数（刚启动、还没干活的树
+  // 太小，不足 64MB 的不当样本）；一个样本都没有就按默认值
+  const samples = panes.filter((p) => p.claude && paneMem[p.id] > 64 * 1024 * 1024)
+    .map((p) => paneMem[p.id]).sort((a, b) => a - b);
+  const perAgent = samples.length ? samples[Math.floor(samples.length / 2)] : DEFAULT_AGENT_RSS;
+  // 给系统留余量（总内存 8% 且至少 256MB），别真把可用内存吃干
+  const reserve = Math.max(256 * 1024 * 1024, memTotal * 0.08);
+  const canOpen = Math.max(0, Math.floor((memAvail - reserve) / perAgent));
+  let disk = null;
+  try {
+    const st = fs.statfsSync(os.homedir());
+    disk = { total: st.blocks * st.bsize, avail: st.bavail * st.bsize };
+  } catch { /* */ }
+  return {
+    mem: { total: memTotal, avail: memAvail },
+    swap: mi.SwapTotal ? { total: mi.SwapTotal, free: mi.SwapFree || 0 } : null,
+    load: os.loadavg(), cpus: os.cpus().length, disk, paneMem,
+    est: { canOpen, perAgent, sampled: samples.length }, // sampled=0 → perAgent 是默认值
+  };
+}
+
 // 去掉 ANSI 转义（SGR / 光标控制 / OSC 标题等），留纯文本供状态解析
 function stripAnsi(s) {
   return String(s)
@@ -1462,6 +1540,10 @@ const server = http.createServer(async (req, res) => {
       if (!TMUX_UI) { sendJSON(res, { enabled: false, panes: [] }); return; }
       sendJSON(res, { enabled: true, panes: await tmuxPanes() }); return;
     }
+    if (p === '/api/tmux/sys') { // 服务器状态 + 「还能再开几个 agent」估算（终端页状态条轮询）
+      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      sendJSON(res, sysSnapshot(await tmuxPanes())); return;
+    }
     if (p === '/api/tmux/pane') { // 抓屏 + 状态解析；lite=1 只回状态（会话控制条轮询用）
       if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       const t = url.searchParams.get('t') || '';
@@ -1576,6 +1658,7 @@ module.exports = {
   refreshIndex, listAll, search, loadSession, deleteSession, summary, INDEX,
   saveIndex, saveBlobs, // 供测试强制落盘（生产走 3s 防抖）
   stripAnsi, paneState, // tmux 桥接的纯函数
+  parseMeminfo, parseProcStat, subtreeRss, sysSnapshot, // 服务器状态
 };
 
 if (require.main === module) {
@@ -1912,6 +1995,18 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 .tnew input{border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:8px;
   padding:6px 9px;font-size:12px;min-width:0;outline:none}
 .tnew input:focus{border-color:var(--accent)}
+.sysbar{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:10px 12px;margin-bottom:10px;font-size:12px;color:var(--muted);
+  display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center}
+.sysbar b{color:var(--ink);font-weight:600}
+.sysbar .est{font-size:12.5px}
+.sysbar .est b{font-size:14px}
+.sysbar .ok b{color:#3fa55e}.sysbar .tight b{color:#c9862a}.sysbar .full b{color:#d64545}
+.membar{display:inline-block;width:72px;height:7px;border-radius:4px;background:var(--field);
+  border:1px solid var(--line);overflow:hidden;vertical-align:-1px;margin-right:6px}
+.membar i{display:block;height:100%;background:var(--accent);border-radius:4px}
+.membar.tight i{background:#c9862a}.membar.full i{background:#d64545}
+.pmem{color:var(--muted);font-size:11px}
 #tname{width:120px}#tcwd{flex:2;min-width:150px}#tcmd{flex:1.2;min-width:150px}
 #tcreate{white-space:nowrap}
 #tcreate:disabled{opacity:.6}

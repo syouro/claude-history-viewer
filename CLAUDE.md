@@ -78,7 +78,9 @@
 - 思路是「翻译层」而非裸终端：`capture-pane` 抓屏 → `paneState()` 解析出交互状态
   （`menu` 编号选项菜单 / `busy` 干活中 / `idle` 空闲 / `unknown`）→ 前端渲染成原生控件
   （选项按钮、聊天输入框）→ UI 操作经 `send-keys` 翻译成按键注回 CLI。裸终端画面是兜底视图。
-- 路由：`GET /api/tmux`（窗格列表）、`GET /api/tmux/pane?t=%N[&lite=1]`（抓屏+状态）、
+- 路由：`GET /api/tmux`（窗格列表）、`GET /api/tmux/sys`（服务器状态：/proc 读内存/负载/磁盘 +
+  每窗格进程树 RSS，估算「还能再开几个 agent」——单价取现有 agent 窗格 RSS 中位数，
+  没有样本按 500MB；终端页顶部状态条 10s 轮询展示）、`GET /api/tmux/pane?t=%N[&lite=1]`（抓屏+状态）、
   `POST /api/tmux/send`（注入；文本走 `-l` 字面量，具名键过 `TMUX_KEYS` 白名单）、
   `POST /api/tmux/new`（新建会话：会话名过白名单、cwd 必须是已存在目录；启动命令会
   包一层 `; exec $SHELL`，命令退出后落回 shell 而不是会话消失）、`POST /api/tmux/kill`（关窗格）、
