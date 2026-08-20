@@ -6,6 +6,8 @@ index.json
 index.blobs.json
 *.json.tmp
 nginx.conf.bak
+# curl 调试用的 cookie 罐（含登录 session）
+cj
 *.log
 node_modules/
 
