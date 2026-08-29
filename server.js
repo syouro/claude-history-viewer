@@ -1109,7 +1109,11 @@ const TMUX_KEYS = new Set(['Enter', 'Escape', 'Tab', 'BTab', 'Up', 'Down', 'Left
 function tmux(args) {
   return new Promise((resolve, reject) => {
     execFile('tmux', args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
-      (err, stdout) => (err ? reject(err) : resolve(stdout)));
+      (err, stdout, stderr) => {
+        if (!err) return resolve(stdout);
+        // execFile 的 err.message 首行是「Command failed: <整条命令>」，真实原因在 stderr
+        reject(new Error(String(stderr || '').trim() || String(err.message || err)));
+      });
   });
 }
 const PANE_FMT = ['#{pane_id}', '#{session_name}', '#{window_index}', '#{window_name}',
@@ -1611,7 +1615,10 @@ const server = http.createServer(async (req, res) => {
       try {
         const paneId = (await tmux(args)).trim();
         sendJSON(res, { ok: true, pane: (await tmuxPanes()).find((x) => x.id === paneId) || null });
-      } catch (e) { sendJSON(res, { error: String(e.message || e).split('\n')[0] }, 500); }
+      } catch (e) {
+        const m = String(e.message || e).split('\n')[0];
+        sendJSON(res, { error: /^duplicate session/.test(m) ? '会话名已存在：' + name : m }, 500);
+      }
       return;
     }
     if (p === '/api/tmux/kill' && req.method === 'POST') { // 关闭窗格（会话的最后一个窗格没了，会话随之结束）
