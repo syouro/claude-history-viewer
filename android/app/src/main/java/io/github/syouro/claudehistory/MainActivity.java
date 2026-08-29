@@ -78,6 +78,10 @@ public class MainActivity extends Activity {
                     else v.loadUrl(home);
                     return true;
                 }
+                // 非 http(s)（about:srcdoc 等页内 iframe、data: 之类）留给 WebView 自己处理，
+                // 别当外链丢给系统浏览器
+                String sch = u.getScheme();
+                if (sch == null || !(sch.equals("http") || sch.equals("https"))) return false;
                 // 同域留在壳内，外链交给系统浏览器
                 String h = Uri.parse(home).getHost();
                 if (u.getHost() != null && u.getHost().equals(h)) return false;

@@ -1611,10 +1611,15 @@ $('#q').addEventListener('input', onQuery);
 // ---------- 文件渲染预览 ----------
 // md 走内置渲染器；html/svg 进沙箱 iframe（allow-scripts 但不同源，拿不到本站 cookie/API）；
 // 其余按纯文本。读的是 /api/file 返回的磁盘当前内容，不是写入当时的快照。
-var PV_CUR = '';
+var PV_CUR = '', PV_PUSHED = false;
 async function openPreview(p) {
   PV_CUR = p;
   var ov = $('#pvov'), body = $('#pvbody');
+  if (!ov.classList.contains('show')) {
+    // 压一个历史状态：手机（尤其安卓壳）按返回键 = 关预览，而不是退出页面
+    history.pushState({ pv: 1 }, '');
+    PV_PUSHED = true;
+  }
   ov.classList.add('show');
   $('#pvname').textContent = p.split('/').pop();
   $('#pvpath').textContent = shortPath(p);
@@ -1638,7 +1643,15 @@ async function openPreview(p) {
     body.firstChild.textContent = j.content;
   }
 }
-function closePreview() { $('#pvov').classList.remove('show'); $('#pvbody').innerHTML = ''; PV_CUR = ''; }
+function pvClose() { $('#pvov').classList.remove('show'); $('#pvbody').innerHTML = ''; PV_CUR = ''; }
+function closePreview() { // ✕ / Esc：先退掉压入的历史状态，由 popstate 真正关，保持历史栈干净
+  if (PV_PUSHED) { history.back(); return; }
+  pvClose();
+}
+window.addEventListener('popstate', function () {
+  PV_PUSHED = false;
+  if ($('#pvov').classList.contains('show')) pvClose();
+});
 document.addEventListener('click', function (e) {
   var b = e.target.closest ? e.target.closest('.pv') : null;
   if (!b) return;
