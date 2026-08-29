@@ -112,6 +112,9 @@
 - 分享 token 带会话作用域（`sp`/`si`），`isAuthed` 拒绝它冒充登录会话。
 - tmux 桥接 = 远程命令执行：所有 `/api/tmux*` 路由都在 `if (!authed)` 之后（不接受分享 token）、
   受 `TMUX_UI` 开关控制；pane 目标过 `PANE_RE`（`^%\d+$`），具名键过白名单，文本长度设上限。
+- `/api/file`（工具块「预览」按钮的后端）：仅登录（不接受分享 token）、只收绝对/`~`路径、
+  扩展名过 `FILE_EXTS` 白名单、限 5MB。前端 html/svg 只进 `sandbox="allow-scripts"` 的 iframe
+  （不给 same-origin，拿不到本站 cookie/API）；md 走内置渲染器（输出已转义）。
 
 ## 缓存与索引（按需加载 + 惰性释放）
 
