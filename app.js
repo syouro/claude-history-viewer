@@ -609,6 +609,15 @@ async function switchChain(agentId, chipEl) {
 
 // ---------- 工具调用友好渲染 ----------
 function shortPath(p) { return String(p || '').replace(/^\/(root|home\/[^/]+)\//, '~/'); }
+// 工具块里的文档类文件（md/html…）给个「预览」按钮，点开全屏渲染磁盘上的当前内容。
+// 只认绝对路径 / ~ 路径：相对路径没法知道当初的 cwd，解析出来会指错文件
+var PV_RE = /\.(md|markdown|html?|svg|txt|json|csv|log)$/i;
+function pvBtn(p) {
+  p = String(p || '');
+  if (SHARE || !PV_RE.test(p) || !/^[/~]/.test(p)) return '';
+  return ' <button class="pv" data-path="' + esc(p).replace(/"/g, '&quot;') +
+    '" title="渲染预览（读取磁盘当前内容）">预览</button>';
+}
 function clip(s, n) {
   s = String(s || '').replace(/\s+/g, ' ').trim();
   return s.length > n ? s.slice(0, n) + '…' : s;
@@ -664,14 +673,16 @@ reg('exec_command', function (i) { return i.cmd; }, function (i, t) { // codex �
 });
 reg('Read', function (i) { return i.file_path; }, function (i) {
   return { sum: '📖 Read · ' + esc(shortPath(i.file_path)) +
-    (i.offset ? esc(' :' + i.offset + (i.limit ? '+' + i.limit : '')) : '') };
+    (i.offset ? esc(' :' + i.offset + (i.limit ? '+' + i.limit : '')) : '') +
+    pvBtn(i.file_path) };
 });
 reg('Write', function (i) { return i.file_path; }, function (i, t) {
-  return { sum: '📝 Write · ' + esc(shortPath(i.file_path)),
+  return { sum: '📝 Write · ' + esc(shortPath(i.file_path)) + pvBtn(i.file_path),
     body: bodyDiv(hi(String(i.content || '').slice(0, 20000), t)) };
 });
 reg('Edit', function (i) { return i.file_path; }, function (i, t) {
-  return { sum: '✏️ Edit · ' + esc(shortPath(i.file_path)) + (i.replace_all ? ' · 全部替换' : ''),
+  return { sum: '✏️ Edit · ' + esc(shortPath(i.file_path)) + (i.replace_all ? ' · 全部替换' : '') +
+    pvBtn(i.file_path),
     body: diffBody(i.old_string, i.new_string, t) };
 });
 reg('NotebookEdit', function (i) { return i.notebook_path; }, function (i) {
@@ -693,7 +704,7 @@ reg('web_search', null, function (i) { // codex 的联网搜索（input 是 acti
 // agy（Antigravity CLI）的工具：args 是大驼峰字段，附带的 toolAction/toolSummary 是给
 // CLI 状态行的提示语，不用专门展示（通用 JSON body 里能看到）
 reg('view_file', function (i) { return i.AbsolutePath; }, function (i) {
-  return { sum: '📖 view_file · ' + esc(shortPath(i.AbsolutePath)) };
+  return { sum: '📖 view_file · ' + esc(shortPath(i.AbsolutePath)) + pvBtn(i.AbsolutePath) };
 });
 reg('list_dir', function (i) { return i.DirectoryPath; }, function (i) {
   return { sum: '📁 list_dir · ' + esc(shortPath(i.DirectoryPath)) };
@@ -712,13 +723,14 @@ reg('read_url_content', function (i) { return i.Url || i.url; }, function (i) {
   return { sum: '🌐 read_url_content · ' + esc(clip(i.Url || i.url, 70)) };
 });
 reg('write_to_file', function (i) { return i.CodeContent !== undefined; }, function (i, t) {
-  return { sum: '📝 write_to_file · ' + esc(shortPath(i.TargetFile || i.AbsolutePath || '')),
+  return { sum: '📝 write_to_file · ' + esc(shortPath(i.TargetFile || i.AbsolutePath || '')) +
+    pvBtn(i.TargetFile || i.AbsolutePath),
     body: bodyDiv(hi(String(i.CodeContent || '').slice(0, 20000), t)) };
 });
 reg('replace_file_content', function (i) { return i.ReplacementContent !== undefined; },
   function (i, t) {
     return { sum: '✏️ replace_file_content · ' + esc(shortPath(i.TargetFile || '')) +
-      (i.Description ? ' · ' + esc(clip(i.Description, 50)) : ''),
+      (i.Description ? ' · ' + esc(clip(i.Description, 50)) : '') + pvBtn(i.TargetFile),
       body: diffBody(i.TargetContent || '', i.ReplacementContent, t) };
   });
 reg('Task Agent', function (i) { return i.prompt || i.description; }, function (i, t, name) {
@@ -758,12 +770,15 @@ reg('ExitPlanMode EnterPlanMode', null, function (i, t, name) {
 // 字符串 input（codex custom_tool_call：apply_patch 补丁 / exec 脚本）单独一张表
 var STR_TOOL_VIEWS = {
   apply_patch: function (inp, terms) {
-    var pfiles = [];
+    var pfiles = [], raws = [];
     inp.split('\n').forEach(function (l) {
-      var m = l.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
+      var m = l.match(/^\*\*\* (?:Add|Update) File: (.+)$/);
+      if (m) raws.push(m[1]);
+      m = m || l.match(/^\*\*\* Delete File: (.+)$/);
       if (m) pfiles.push(shortPath(m[1]));
     });
-    return { sum: '✏️ apply_patch' + (pfiles.length ? ' · ' + esc(clip(pfiles.join(', '), 80)) : ''),
+    return { sum: '✏️ apply_patch' + (pfiles.length ? ' · ' + esc(clip(pfiles.join(', '), 80)) : '') +
+      raws.slice(0, 3).map(pvBtn).join(''), // 删除的文件不给预览按钮
       body: patchBody(inp, terms) };
   },
 };
@@ -1593,6 +1608,49 @@ async function doLogin() {
 
 // ---------- 绑定 ----------
 $('#q').addEventListener('input', onQuery);
+// ---------- 文件渲染预览 ----------
+// md 走内置渲染器；html/svg 进沙箱 iframe（allow-scripts 但不同源，拿不到本站 cookie/API）；
+// 其余按纯文本。读的是 /api/file 返回的磁盘当前内容，不是写入当时的快照。
+var PV_CUR = '';
+async function openPreview(p) {
+  PV_CUR = p;
+  var ov = $('#pvov'), body = $('#pvbody');
+  ov.classList.add('show');
+  $('#pvname').textContent = p.split('/').pop();
+  $('#pvpath').textContent = shortPath(p);
+  body.className = 'pvbody'; body.innerHTML = '<div class="empty">读取中…</div>';
+  var j;
+  try { j = await (await fetch('api/file?path=' + encodeURIComponent(p))).json(); }
+  catch (e) { j = { error: '拉取失败：' + e }; }
+  if (PV_CUR !== p || !ov.classList.contains('show')) return; // 已关闭或又点开了别的
+  if (j.error) { body.innerHTML = '<div class="empty">' + esc(j.error) + '</div>'; return; }
+  var ext = (j.ext || '').toLowerCase();
+  if (ext === '.html' || ext === '.htm' || ext === '.svg') {
+    body.className = 'pvbody raw'; body.innerHTML = '';
+    var ifr = document.createElement('iframe');
+    ifr.setAttribute('sandbox', 'allow-scripts');
+    body.appendChild(ifr);
+    ifr.srcdoc = j.content;
+  } else if (ext === '.md' || ext === '.markdown') {
+    body.innerHTML = '<div class="mdbody md">' + md(j.content, []) + '</div>';
+  } else {
+    body.innerHTML = '<pre></pre>';
+    body.firstChild.textContent = j.content;
+  }
+}
+function closePreview() { $('#pvov').classList.remove('show'); $('#pvbody').innerHTML = ''; PV_CUR = ''; }
+document.addEventListener('click', function (e) {
+  var b = e.target.closest ? e.target.closest('.pv') : null;
+  if (!b) return;
+  e.preventDefault(); e.stopPropagation(); // 按钮长在 <summary> 里，别顺手折叠了工具块
+  openPreview(b.dataset.path);
+});
+$('#pvx').onclick = closePreview;
+$('#pvre').onclick = function () { if (PV_CUR) openPreview(PV_CUR); };
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' && $('#pvov').classList.contains('show')) closePreview();
+});
+
 $('#q').addEventListener('keydown', function (e) {
   if (e.key === 'Escape') { e.target.value = ''; searchMode = false; render(''); }
 });

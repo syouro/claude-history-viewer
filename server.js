@@ -1102,6 +1102,8 @@ function toMarkdown(s) {
 // 思路：不裸搬终端，而是加一层「翻译」——后端 capture-pane 抓屏并解析出 Claude Code 的
 // 交互状态（空闲输入框 / 编号选项菜单 / 忙碌中），前端渲染成原生控件；用户的 UI 操作再由
 // send-keys 翻译成按键注回 CLI。裸终端画面只作兜底视图。
+// /api/file 允许预览的扩展名（会话里 Write/Edit 产出的文档类文件；代码文件看工具块就够了）
+const FILE_EXTS = new Set(['.md', '.markdown', '.html', '.htm', '.svg', '.txt', '.json', '.csv', '.log']);
 const PANE_RE = /^%\d+$/; // 只接受 tmux pane id（如 %3），防注入 / 选项注入
 // send-keys 允许的具名按键白名单（文本走 -l 字面量通道，不查这个表）
 const TMUX_KEYS = new Set(['Enter', 'Escape', 'Tab', 'BTab', 'Up', 'Down', 'Left', 'Right',
@@ -1441,6 +1443,25 @@ const server = http.createServer(async (req, res) => {
     if (!authed) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
 
     if (p === '/api/sessions') { sendJSON(res, listAll()); return; }
+    if (p === '/api/file') { // 文件渲染预览：读盘上当前内容（仅登录，不接受分享 token）
+      const rawP = String(url.searchParams.get('path') || '');
+      const fp = path.resolve(expandHome(rawP));
+      const ext = path.extname(fp).toLowerCase();
+      if (!rawP.startsWith('/') && !rawP.startsWith('~')) {
+        sendJSON(res, { error: '只支持绝对路径' }, 400); return;
+      }
+      if (!FILE_EXTS.has(ext)) {
+        sendJSON(res, { error: '只支持文本类文件预览（md / html / svg / txt / json…）' }, 400); return;
+      }
+      try {
+        const st = fs.statSync(fp);
+        if (!st.isFile()) throw new Error('not a file');
+        if (st.size > 5 * 1024 * 1024) { sendJSON(res, { error: '文件太大（>5MB）' }, 413); return; }
+        sendJSON(res, { path: fp, ext, size: st.size, mtime: st.mtimeMs,
+          content: fs.readFileSync(fp, 'utf8') });
+      } catch { sendJSON(res, { error: '读不到文件：' + fp }, 404); }
+      return;
+    }
     if (p === '/api/share' && req.method === 'POST') {
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
@@ -1961,6 +1982,25 @@ mark.cur{outline:2px solid var(--accent);border-radius:3px}
 details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
 .msg.agent .who{color:#7c6bd6}
 /* tmux 控制条（会话视图底部）与控制台 */
+.pv{border:1px solid var(--line);background:var(--field);color:var(--muted);border-radius:7px;
+  padding:1px 8px;font-size:11px;cursor:pointer;margin-left:8px;vertical-align:1px}
+.pv:hover{border-color:var(--accent);color:var(--ink)}
+#pvov{display:none;position:fixed;inset:0;background:var(--bg);z-index:12;flex-direction:column}
+#pvov.show{display:flex}
+#pvov .pvbar{display:flex;align-items:center;gap:10px;padding:8px 14px;
+  border-bottom:1px solid var(--line);background:var(--panel);flex-shrink:0}
+#pvov .pvbar b{font-size:13px;white-space:nowrap}
+#pvov .pvbar .mono{color:var(--muted);font-size:11px;flex:1;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+#pvov .pvbar button{border:1px solid var(--line);background:var(--field);color:var(--ink);
+  border-radius:8px;padding:4px 11px;cursor:pointer;font-size:13px}
+#pvov .pvbar button:hover{border-color:var(--accent)}
+#pvov .pvbody{flex:1;overflow:auto;padding:16px 22px}
+#pvov .pvbody .mdbody{max-height:none;max-width:820px;margin:0 auto}
+#pvov .pvbody pre{white-space:pre-wrap;word-break:break-word;
+  font:12px/1.55 ui-monospace,Menlo,monospace;max-width:900px;margin:0 auto}
+#pvov .pvbody.raw{padding:0;display:flex}
+#pvov .pvbody.raw iframe{flex:1;border:0;width:100%;background:#fff}
 #composer{display:none;border-top:1px solid var(--line);background:var(--panel);padding:8px 14px 6px}
 #composer.show{display:block}
 .crow{display:flex;gap:6px;align-items:flex-end;max-width:860px;margin:0 auto}
@@ -2104,6 +2144,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
     <div class="crow ckeys">
       <button class="ckey" data-k="Escape" title="Esc：打断 / 取消">Esc</button>
       <button class="ckey" data-k="C-c" title="Ctrl+C：退出程序（Claude Code 要连按两下）">^C</button>
+      <button class="ckey" data-k="Tab" title="Tab：接受输入框里的灰色补全提示 / 补全命令">⇥</button>
       <button class="ckey" data-k="BTab" title="Shift+Tab：切换权限模式">⇧⇥</button>
       <button class="ckey" data-k="Up" title="↑">↑</button>
       <button class="ckey" data-k="Down" title="↓">↓</button>
@@ -2113,6 +2154,11 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <button id="cterm" title="打开终端画面">▣</button>
     </div>
     <div class="ctarget" id="ctarget"></div>
+  </div>
+  <div id="pvov">
+    <div class="pvbar"><b id="pvname"></b><span class="mono" id="pvpath"></span>
+      <button id="pvre" title="重新从磁盘读取">↻</button><button id="pvx" title="关闭（Esc）">✕</button></div>
+    <div class="pvbody" id="pvbody"></div>
   </div>
 </main>
 
