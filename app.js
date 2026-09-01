@@ -2,6 +2,8 @@
 var $ = function (s) { return document.querySelector(s); };
 var sessions = [], current = null, searchMode = false, lastTerms = [], favs = {};
 var SHARE = new URLSearchParams(location.search).get('share'); // 访客只读模式
+// 登录身份（/api/me 回填）：子账号只读，收藏/删除/tmux/文件区都不给
+var ME = { admin: false, user: '', canShare: false };
 // 数据源：claude / codex / agy 各自一页（列表、搜索、统计互不混）。收藏键与后端 keyOf 对齐
 var SRCS = ['claude', 'codex', 'agy'];
 var SRC = SRCS.indexOf(localStorage.getItem('chv-src')) >= 0
@@ -354,6 +356,10 @@ async function open(s, jumpIdx) {
     $('#fav').style.display = 'none'; $('#share').style.display = 'none';
     $('#del').style.display = 'none'; // 访客只读，不能删
     $('#sub').innerHTML += '<span class="robadge">只读分享</span>';
+  } else if (!ME.admin) { // 子账号：只读，收藏/删除藏掉，分享看权限
+    $('#fav').style.display = 'none'; $('#del').style.display = 'none';
+    $('#share').style.display = ME.canShare ? '' : 'none';
+    $('#sub').innerHTML += '<span class="robadge">只读账号</span>';
   }
   syncFavUI(data);
   renderChains(data);
@@ -614,7 +620,7 @@ function shortPath(p) { return String(p || '').replace(/^\/(root|home\/[^/]+)\//
 var PV_RE = /\.(md|markdown|html?|svg|txt|json|csv|log)$/i;
 function pvBtn(p) {
   p = String(p || '');
-  if (SHARE || !PV_RE.test(p) || !/^[/~]/.test(p)) return '';
+  if (SHARE || !ME.admin || !PV_RE.test(p) || !/^[/~]/.test(p)) return ''; // /api/file 仅管理员
   return ' <button class="pv" data-path="' + esc(p).replace(/"/g, '&quot;') +
     '" title="渲染预览（读取磁盘当前内容）">预览</button>';
 }
@@ -1535,6 +1541,182 @@ async function pollPane(t) {
   paneTimer = setTimeout(function () { pollPane(t); }, paneDelay());
 }
 
+// ---------- 文件区（上传 md / 图片 + 在线编辑，仅管理员，见 /api/files*） ----------
+var UP_IMG_RE = /^\.(png|jpe?g|gif|webp)$/;
+var UPFILES = [];
+function upExt(name) { return ('.' + String(name).split('.').pop()).toLowerCase(); }
+function upIcon(ext) {
+  return UP_IMG_RE.test(ext) ? '🖼' : /^\.(md|markdown)$/.test(ext) ? '📝' : '📄';
+}
+function fmtSize(b) {
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + 'MB';
+  if (b >= 1024) return Math.round(b / 1024) + 'KB';
+  return b + 'B';
+}
+async function openFilesPage() {
+  current = null; view.mode = 'files'; clearTimeout(liveTimer);
+  stopPane(); hideComposer();
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none'; hideUdetail(); hideHits();
+  var j = {};
+  try { j = await (await fetch('api/files')).json(); } catch (e) { /* */ }
+  if (view.mode !== 'files') return;
+  UPFILES = j.files || [];
+  var h = '<div class="wrap"><div class="termbar"><b>📁 文件</b><span>' + UPFILES.length +
+    ' 个 · md 可在线编辑</span>' +
+    '<button id="fup">⇧ 上传</button><button id="fnew">＋ 新建 md</button>' +
+    '<button id="frefresh">刷新</button>' +
+    '<input type="file" id="fpick" multiple style="display:none" accept=".md,.markdown,.txt,' +
+    '.json,.csv,.log,.html,.htm,.svg,.png,.jpg,.jpeg,.gif,.webp,.pdf"></div>';
+  if (j.error) h += '<div class="empty">' + esc(j.error) + '</div>';
+  else if (!UPFILES.length)
+    h += '<div class="empty">还没有文件<br><br>「上传」放 md / 图片进来，或「新建 md」直接写</div>';
+  h += UPFILES.map(function (f, i) {
+    return '<div class="item" data-i="' + i + '"><div class="t">' + upIcon(f.ext) + ' ' +
+      esc(f.name) + '</div><div class="r"><span>' + fmtSize(f.size) + '</span><span>' +
+      rel(f.mtime) + '</span><button class="fdel" data-i="' + i + '">删除</button></div></div>';
+  }).join('') + '</div>';
+  var conv = $('#conv');
+  conv.innerHTML = h; conv.scrollTop = 0;
+  $('#frefresh').onclick = openFilesPage;
+  $('#fup').onclick = function () { $('#fpick').click(); };
+  $('#fpick').onchange = async function () {
+    var fl = Array.prototype.slice.call(this.files || []);
+    for (var i = 0; i < fl.length; i++) await uploadOne(fl[i]);
+    openFilesPage();
+  };
+  $('#fnew').onclick = function () {
+    var n = prompt('新建文件名（md / txt）：', '笔记-' + dayStr(Date.now()) + '.md');
+    if (!n) return;
+    n = n.trim();
+    if (!/\.(md|markdown|txt)$/i.test(n)) n += '.md';
+    if (UPFILES.some(function (f) { return f.name === n; })) { alert('已存在同名文件：' + n); return; }
+    editUpFile(n, '', true);
+  };
+  conv.querySelectorAll('.item[data-i]').forEach(function (el) {
+    el.onclick = function () { openUpPreview(UPFILES[+el.dataset.i].name); };
+  });
+  conv.querySelectorAll('.fdel').forEach(function (b) {
+    b.onclick = async function (e) {
+      e.stopPropagation(); // 别顺手打开了预览
+      var f = UPFILES[+b.dataset.i];
+      if (!confirm('删除文件 ' + f.name + '？不可恢复。')) return;
+      var r = await fetch('api/files/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: f.name })
+      });
+      var jj = await r.json().catch(function () { return {}; });
+      if (!jj.ok) { alert('删除失败：' + (jj.error || r.status)); return; }
+      openFilesPage();
+    };
+  });
+  render($('#q').value.trim());
+}
+// 与后端 safeUpName 同款白名单：不合规字符替换成 -（相机文件名常见奇怪符号）
+function upSafeName(n) {
+  return String(n || '').trim()
+    .replace(/[^\w.()（）【】一-鿿 -]+/g, '-').replace(/^[.-]+/, '').slice(0, 120);
+}
+async function uploadOne(f, force) {
+  var name = upSafeName(f.name);
+  var r = await fetch('api/files/upload?name=' + encodeURIComponent(name) +
+    (force ? '&force=1' : ''), { method: 'POST', body: f });
+  var j = await r.json().catch(function () { return {}; });
+  if (r.status === 409 && !force) {
+    if (confirm('已存在同名文件：' + name + '\n\n覆盖吗？')) return uploadOne(f, true);
+    return;
+  }
+  if (!j.ok) alert('上传失败：' + name + ' — ' + (j.error || r.status));
+}
+// 复用会话里的预览浮层（#pvov）看文件区的文件；文本类多一个「编辑」按钮
+async function openUpPreview(name) {
+  var ext = upExt(name);
+  var ov = $('#pvov'), body = $('#pvbody');
+  if (!ov.classList.contains('show')) { history.pushState({ pv: 1 }, ''); PV_PUSHED = true; }
+  ov.classList.add('show');
+  PV_CUR = 'up:' + name;
+  $('#pvname').textContent = name; $('#pvpath').textContent = '文件区';
+  $('#pved').style.display = 'none';
+  $('#pvdl').style.display = '';
+  $('#pvdl').onclick = function () {
+    location.href = 'api/files/raw?dl=1&name=' + encodeURIComponent(name);
+  };
+  body.className = 'pvbody'; body.innerHTML = '<div class="empty">读取中…</div>';
+  if (UP_IMG_RE.test(ext)) {
+    body.className = 'pvbody imgv';
+    body.innerHTML = '<img src="api/files/raw?name=' + encodeURIComponent(name) + '" alt="">';
+    return;
+  }
+  if (!/^\.(md|markdown|txt|json|csv|log|html?|svg)$/.test(ext)) { // pdf 等二进制：只给下载
+    body.innerHTML = '<div class="empty">该类型不支持预览，点右上角 ⇩ 下载</div>';
+    return;
+  }
+  var j;
+  try { j = await (await fetch('api/files/get?name=' + encodeURIComponent(name))).json(); }
+  catch (e) { j = { error: '拉取失败：' + e }; }
+  if (PV_CUR !== 'up:' + name || !ov.classList.contains('show')) return;
+  if (j.error) { body.innerHTML = '<div class="empty">' + esc(j.error) + '</div>'; return; }
+  $('#pved').style.display = '';
+  $('#pved').onclick = function () { editUpFile(name, j.content); };
+  if (ext === '.html' || ext === '.htm' || ext === '.svg') {
+    body.className = 'pvbody raw'; body.innerHTML = '';
+    var ifr = document.createElement('iframe');
+    ifr.setAttribute('sandbox', 'allow-scripts'); // 不给 same-origin，拿不到本站 cookie/API
+    body.appendChild(ifr);
+    ifr.srcdoc = j.content;
+  } else if (ext === '.md' || ext === '.markdown') {
+    body.innerHTML = '<div class="mdbody md">' + md(j.content, []) + '</div>';
+  } else {
+    body.innerHTML = '<pre></pre>';
+    body.firstChild.textContent = j.content;
+  }
+}
+// 在线编辑器（textarea + 预览切换 + 保存）；PV_ORIG 用来做未保存提醒
+var PV_ORIG = '';
+function editUpFile(name, content, isNew) {
+  var ov = $('#pvov'), body = $('#pvbody');
+  if (!ov.classList.contains('show')) { history.pushState({ pv: 1 }, ''); PV_PUSHED = true; }
+  ov.classList.add('show');
+  PV_CUR = 'edit:' + name; PV_ORIG = content;
+  $('#pvname').textContent = (isNew ? '新建 · ' : '编辑 · ') + name;
+  $('#pvpath').textContent = '文件区';
+  $('#pved').style.display = 'none'; $('#pvdl').style.display = 'none';
+  body.className = 'pvbody edit';
+  body.innerHTML = '<div class="edwrap"><textarea id="fed" spellcheck="false"></textarea>' +
+    '<div class="edbar"><span id="edmsg"></span>' +
+    (/\.(md|markdown)$/.test(upExt(name)) ? '<button id="edpv">预览</button>' : '') +
+    '<button id="edsave">保存</button></div></div>';
+  $('#fed').value = content;
+  $('#edsave').onclick = async function () {
+    var v = $('#fed').value;
+    var r = await fetch('api/files/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, content: v })
+    });
+    var j = await r.json().catch(function () { return {}; });
+    if (!j.ok) { alert('保存失败：' + (j.error || r.status)); return; }
+    PV_ORIG = v;
+    $('#edmsg').textContent = '✓ 已保存 ' + new Date().toLocaleTimeString('zh-CN');
+  };
+  var pb = $('#edpv');
+  if (pb) pb.onclick = function () { // 就地切换 编辑 ⇄ 渲染，不动 textarea 内容
+    var t = $('#fed'), pvd = $('#edrender');
+    if (pvd) { pvd.remove(); t.style.display = ''; pb.textContent = '预览'; return; }
+    pvd = document.createElement('div'); pvd.id = 'edrender'; pvd.className = 'md';
+    pvd.innerHTML = md(t.value, []);
+    t.style.display = 'none'; t.parentNode.insertBefore(pvd, t);
+    pb.textContent = '继续编辑';
+  };
+  setTimeout(function () { $('#fed').focus(); }, 50);
+}
+function pvDirty() {
+  var t = $('#fed');
+  return !!t && String(PV_CUR).slice(0, 5) === 'edit:' && t.value !== PV_ORIG;
+}
+$('#filesBtn').onclick = function () {
+  document.body.classList.remove('nav-open');
+  openFilesPage();
+};
+
 // ---------- 数据源切换（Claude / Codex / Agy 各自一页） ----------
 function syncSrcUI() {
   // 有任一附加源才显示页签条；没启用的源藏掉自己的按钮
@@ -1581,12 +1763,24 @@ function initTheme() {
 function showLogin() {
   $('#login').style.display = 'flex'; $('#side').style.display = 'none';
   $('#main').style.display = 'none'; $('#menuBtn').style.display = 'none';
+  // 清掉上一个身份留在主区的内容（换账号登录时不该看到别人的页面）
+  current = null; clearTimeout(liveTimer); stopPane(); hideComposer();
+  view.mode = 'idle';
+  $('#top').style.display = 'none'; $('#chains').style.display = 'none';
+  hideUdetail(); hideHits();
+  $('#conv').innerHTML = '<div class="empty">← 选择左侧的一段对话开始查看</div>';
   setTimeout(function () { $('#pw').focus(); }, 50);
+}
+function applyMe(me) {
+  ME.admin = !!me.admin; ME.user = me.user || ''; ME.canShare = !!me.canShare;
+  SRC_ON.codex = !!me.codex; SRC_ON.agy = !!me.agy;
+  if (!SRC_ON[SRC]) SRC = 'claude'; // 当前源被关掉后别卡在空页
 }
 function showApp() {
   $('#login').style.display = 'none'; $('#side').style.display = 'flex';
   $('#main').style.display = 'flex';
   $('#menuBtn').style.display = ''; // 交回 CSS 控制（桌面隐藏/移动显示）
+  $('#filesBtn').style.display = ME.admin ? '' : 'none'; // 文件区仅管理员
   syncSrcUI();
   loadTmux();
   loadFavs().then(loadList).then(navFromHash).then(function () {
@@ -1599,11 +1793,14 @@ async function doLogin() {
   var pw = $('#pw').value; $('#loginErr').textContent = '';
   var r = await fetch('api/login', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password: pw })
+    body: JSON.stringify({ user: $('#lu').value.trim(), password: pw })
   });
   var j = await r.json();
-  if (r.ok && j.ok) { $('#pw').value = ''; showApp(); }
-  else $('#loginErr').textContent = j.error || '登录失败';
+  if (r.ok && j.ok) {
+    $('#pw').value = '';
+    applyMe(await (await fetch('api/me')).json()); // 登进来是谁（管理员/子账号）决定界面
+    showApp();
+  } else $('#loginErr').textContent = j.error || '登录失败';
 }
 
 // ---------- 绑定 ----------
@@ -1620,6 +1817,7 @@ async function openPreview(p) {
     history.pushState({ pv: 1 }, '');
     PV_PUSHED = true;
   }
+  $('#pved').style.display = 'none'; $('#pvdl').style.display = 'none'; // 文件区专用按钮
   ov.classList.add('show');
   $('#pvname').textContent = p.split('/').pop();
   $('#pvpath').textContent = shortPath(p);
@@ -1643,14 +1841,25 @@ async function openPreview(p) {
     body.firstChild.textContent = j.content;
   }
 }
-function pvClose() { $('#pvov').classList.remove('show'); $('#pvbody').innerHTML = ''; PV_CUR = ''; }
+function pvClose() {
+  $('#pvov').classList.remove('show'); $('#pvbody').innerHTML = '';
+  var wasEdit = String(PV_CUR).slice(0, 5) === 'edit:';
+  PV_CUR = ''; PV_ORIG = '';
+  $('#pved').style.display = 'none'; $('#pvdl').style.display = 'none';
+  if (wasEdit && view.mode === 'files') openFilesPage(); // 编辑完回列表，顺带刷新
+}
 function closePreview() { // ✕ / Esc：先退掉压入的历史状态，由 popstate 真正关，保持历史栈干净
+  if (pvDirty() && !confirm('有未保存的修改，放弃吗？')) return;
   if (PV_PUSHED) { history.back(); return; }
   pvClose();
 }
 window.addEventListener('popstate', function () {
   PV_PUSHED = false;
-  if ($('#pvov').classList.contains('show')) pvClose();
+  if (!$('#pvov').classList.contains('show')) return;
+  if (pvDirty() && !confirm('有未保存的修改，放弃吗？')) {
+    history.pushState({ pv: 1 }, ''); PV_PUSHED = true; return; // 反悔：把状态压回去
+  }
+  pvClose();
 });
 document.addEventListener('click', function (e) {
   var b = e.target.closest ? e.target.closest('.pv') : null;
@@ -1659,7 +1868,15 @@ document.addEventListener('click', function (e) {
   openPreview(b.dataset.path);
 });
 $('#pvx').onclick = closePreview;
-$('#pvre').onclick = function () { if (PV_CUR) openPreview(PV_CUR); };
+$('#pvre').onclick = function () { // 重新读取：按来源分发（磁盘路径 / 文件区 / 编辑器）
+  if (!PV_CUR) return;
+  var s = String(PV_CUR);
+  if (s.slice(0, 3) === 'up:') openUpPreview(s.slice(3));
+  else if (s.slice(0, 5) === 'edit:') {
+    if (pvDirty() && !confirm('重新读取会丢掉未保存的修改，继续吗？')) return;
+    openUpPreview(s.slice(5));
+  } else openPreview(PV_CUR);
+};
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape' && $('#pvov').classList.contains('show')) closePreview();
 });
@@ -1708,6 +1925,58 @@ $('#csend').onclick = function () {
 $('#cin').addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#csend').onclick(); }
 });
+// 对话输入框贴图/传文件：上传进文件区（files/），把服务器绝对路径插进输入框——
+// 发出去后 tmux 里的 CLI agent 直接 Read 这个路径就能看到内容
+function tsName() {
+  var d = new Date(), p = function (n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' +
+    p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+async function composerUpload(files) {
+  if (!files.length) return;
+  var btn = $('#cattach'); btn.textContent = '⏳';
+  try {
+    var paths = [];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var name = upSafeName(f.name);
+      // 剪贴板贴图的名字千篇一律（image.png / blob），换成带时间戳的
+      if (!name || /^(image|blob)\.\w+$/i.test(name)) {
+        var ext = ((f.type || '').split('/')[1] || 'png').replace('jpeg', 'jpg');
+        name = '贴-' + tsName() + '.' + ext;
+      }
+      var r = await fetch('api/files/upload?auto=1&name=' + encodeURIComponent(name),
+        { method: 'POST', body: f });
+      var j = await r.json().catch(function () { return {}; });
+      if (j.ok && j.path) paths.push(j.path);
+      else alert('上传失败：' + name + ' — ' + (j.error || r.status));
+    }
+    if (paths.length) {
+      var t = $('#cin');
+      var sep = t.value && !/\s$/.test(t.value) ? ' ' : '';
+      t.value += sep + paths.join(' ') + ' ';
+      t.focus();
+    }
+  } finally { btn.textContent = '📎'; }
+}
+$('#cattach').onclick = function () { $('#cfile').click(); };
+$('#cfile').onchange = function () {
+  composerUpload(Array.prototype.slice.call(this.files || []));
+  this.value = ''; // 允许连续选同一个文件
+};
+$('#cin').addEventListener('paste', function (e) {
+  var fl = e.clipboardData && e.clipboardData.files;
+  if (!fl || !fl.length) return;
+  e.preventDefault(); // 有文件就不往输入框贴乱码
+  composerUpload(Array.prototype.slice.call(fl));
+});
+$('#cin').addEventListener('dragover', function (e) { e.preventDefault(); });
+$('#cin').addEventListener('drop', function (e) {
+  var fl = e.dataTransfer && e.dataTransfer.files;
+  if (!fl || !fl.length) return;
+  e.preventDefault();
+  composerUpload(Array.prototype.slice.call(fl));
+});
 document.querySelectorAll('#composer .ckey').forEach(function (b) {
   b.onclick = function () { sendTmux({ keys: [b.dataset.k] }); };
 });
@@ -1723,13 +1992,13 @@ $('#menuBtn').onclick = function () { document.body.classList.toggle('nav-open')
 $('#scrim').onclick = function () { document.body.classList.remove('nav-open'); };
 $('#loginBtn').onclick = doLogin;
 $('#pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+$('#lu').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('#pw').focus(); });
 $('#logout').onclick = async function () { await fetch('api/logout'); showLogin(); };
 
 initTheme();
 (async function () {
   var me = await (await fetch('api/me')).json();
-  SRC_ON.codex = !!me.codex; SRC_ON.agy = !!me.agy;
-  if (!SRC_ON[SRC]) SRC = 'claude'; // 当前源被关掉后别卡在空页
+  applyMe(me);
   if (me.authed) showApp();
   else if (SHARE) showShareView();
   else showLogin();

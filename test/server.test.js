@@ -175,4 +175,29 @@ test('deleteSession：删文件、清索引，搜索/列表随之消失', () => 
   assert.equal(S.deleteSession('../evil', 'x'), false);   // 路径穿越被拒
 });
 
+test('projAllowed：管理员全通，子账号按 projects glob 白名单', () => {
+  const admin = { admin: true };
+  const acc = { admin: false, projects: ['-root-codexDir-HNLGDT*'].map(S.globToRe), share: true };
+  assert.ok(S.projAllowed(admin, '-root-codexDir-Hearth'));
+  assert.ok(S.projAllowed(acc, '-root-codexDir-HNLGDT'));
+  assert.ok(S.projAllowed(acc, '-root-codexDir-HNLGDT-sub')); // 通配尾
+  assert.ok(!S.projAllowed(acc, '-root-codexDir-Hearth'));    // 不在白名单
+  assert.ok(!S.projAllowed(null, '-root-codexDir-HNLGDT'));   // 未登录
+  const empty = { admin: false, projects: [], share: false };
+  assert.ok(!S.projAllowed(empty, 'anything'));               // 空白名单啥也看不见
+});
+
+test('safeUpName：文件区文件名白名单（防穿越 / 限扩展名）', () => {
+  assert.equal(S.safeUpName('笔记-2026.md'), '笔记-2026.md');
+  assert.equal(S.safeUpName('IMG_1234.PNG'), 'IMG_1234.PNG');   // 大写扩展名也认
+  assert.equal(S.safeUpName('a b (1).jpeg'), 'a b (1).jpeg');
+  assert.equal(S.safeUpName('../../etc/passwd'), null);         // 路径穿越
+  assert.equal(S.safeUpName('..md'), null);                     // 点开头
+  assert.equal(S.safeUpName('.hidden.md'), null);
+  assert.equal(S.safeUpName('a/b.md'), null);                   // 带分隔符
+  assert.equal(S.safeUpName('evil.sh'), null);                  // 扩展名不在白名单
+  assert.equal(S.safeUpName('noext'), null);
+  assert.equal(S.safeUpName(''), null);
+});
+
 test.after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* */ } });

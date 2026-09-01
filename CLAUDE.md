@@ -14,10 +14,12 @@
 - `app.js` — 前端 JS，由 `/app.js` 路由原样吐出；含**手写的轻量 Markdown 渲染器**
   （`md()`/`mdBlocks()`/`mdInline()`/表格），不依赖任何前端库。
   URL 带 `?v=<app.js mtime>`，改前端不用清缓存。
-- 数据文件（均 gitignore，自动生成，勿入库）：
+- 数据文件（均 gitignore，自动生成/手工维护，勿入库）：
   - `config.json` — 服务配置（扫描根、排除、端口等）；缺省全走默认值
   - `secret.json` — HMAC 密钥 + 登录密码（chmod 600）
-  - `favorites.json` — 收藏与备注
+  - `accounts.json` — 只读子账号（手工编辑，见「子账号」）
+  - `favorites.json` — 收藏与备注（管理员私有，子账号拿不到）
+  - `files/` — 文件区的上传/笔记目录（见「文件区」）
   - `index.json` — 列表/搜索索引（见下）
 
 ## 关键约定
@@ -27,6 +29,36 @@
 - **多根扫描**：`roots` 可配多个；同名 项目/会话 在多根并存时**先配置的根优先**。
 - **排除**：`exclude` 按项目目录名做 glob（`*` `?`）匹配，命中的项目既不列出、API 也拒绝
   （对 codex 按 cwd 推导出的项目名同样生效）。
+
+## 子账号（accounts.json，只读 + 按项目白名单）
+
+- 用途：给领导等外人看**指定项目**的对话，不暴露其他项目。手工编辑 `accounts.json`：
+  ```json
+  { "leader": { "password": "xxx", "projects": ["-root-codexDir-HNLGDT*"], "share": true } }
+  ```
+  `projects` 是**项目目录名**的 glob（与 `exclude` 同款语法；codex/agy 的 cwd 推导名同样适用）；
+  `share` 允许该账号生成分享链接。改文件即时生效（mtime 缓存）；**删账号 = 吊销其所有已登录会话**
+  （`authOf` 每次都查账号还在不在）。权限做成字段是为了以后好扩档（比如给某账号开 tmux）。
+- 登录：登录框多一个用户名（管理员留空走 `secret.json` 密码）；token 里子账号带 `u` 字段，
+  管理员 token 不带（老 cookie 兼容）。
+- 子账号一律**只读**：列表/会话/搜索/统计/导出全按 `projAllowed()` 过滤；
+  删除、收藏、`/api/file`、`/api/files*`、`/api/tmux*` 全部仅管理员（`admin` 判定）。
+  新加涉写或跨项目的路由时**务必**加同款判定。
+
+## 文件区（/api/files*，仅管理员）
+
+- 独立「📁 文件」页签：上传 md/图片，md/txt 可在线编辑保存，图片直出预览，
+  html/svg 只进 `allow-scripts` 沙箱 iframe（与 `/api/file` 同款，防拿本站 cookie）。
+- 与 `/api/file` 的区别：这里**可写**，但只圈在 `files/` 一个目录里——
+  文件名过 `safeUpName()`（白名单字符、不许点开头、不含分隔符 → 无法穿越），
+  扩展名限 `UP_TEXT`/`UP_IMG`，单文件 10MB。
+- `/api/files/raw` 只直出图片（html/svg 当文档打开能跑同源脚本），其余类型仅 `dl=1` 附件下载；
+  pdf 等 `UP_BIN` 只存和下载、不预览。
+- 上传是原始字节体 + 查询串文件名（零依赖不解析 multipart）；重名回 409，`force=1` 覆盖，
+  `auto=1` 自动加 `-2/-3` 后缀改名（对话框贴图用），响应带盘上绝对 `path`。
+- **对话输入框贴文件**：`#cin` 粘贴/拖放/📎 选择的文件走 `composerUpload()` 传进文件区，
+  把绝对路径插进输入框——发给 tmux 里的 CLI 后 agent 直接 Read 该路径。
+  剪贴板贴图统一叫 image.png，前端换成 `贴-<时间戳>.<ext>`。
 
 ## codex 数据源（Claude / Codex 两页独立）
 
@@ -109,10 +141,12 @@
 - 前端所有拼进 innerHTML 的动态文本都过 `esc()`/`hi()` 转义；新增渲染同样处理。
 - 后端 `project`/`id` 一律过 `NAME_RE`（`^[A-Za-z0-9._-]+$`）白名单，防路径穿越。
 - 密码与 token 用 `crypto.timingSafeEqual` 常数时间比较；登录限速 + 指数退避 + 固定延时。
-- 分享 token 带会话作用域（`sp`/`si`），`isAuthed` 拒绝它冒充登录会话。
-- tmux 桥接 = 远程命令执行：所有 `/api/tmux*` 路由都在 `if (!authed)` 之后（不接受分享 token）、
+- 分享 token 带会话作用域（`sp`/`si`），`authOf` 拒绝它冒充登录会话。
+- 子账号（见「子账号」）：所有读接口按项目白名单过滤，所有写接口与
+  `/api/file`、`/api/tmux*`、`/api/files*` 仅管理员；新路由照此办理。
+- tmux 桥接 = 远程命令执行：所有 `/api/tmux*` 路由仅管理员（不接受分享 token、子账号也拒）、
   受 `TMUX_UI` 开关控制；pane 目标过 `PANE_RE`（`^%\d+$`），具名键过白名单，文本长度设上限。
-- `/api/file`（工具块「预览」按钮的后端）：仅登录（不接受分享 token）、只收绝对/`~`路径、
+- `/api/file`（工具块「预览」按钮的后端）：仅管理员（不接受分享 token）、只收绝对/`~`路径、
   扩展名过 `FILE_EXTS` 白名单、限 5MB。前端 html/svg 只进 `sandbox="allow-scripts"` 的 iframe
   （不给 same-origin，拿不到本站 cookie/API）；md 走内置渲染器（输出已转义）。
 
@@ -130,7 +164,7 @@
 ## 删除会话
 
 - `deleteSession()`：`fs.unlinkSync` 删 `.jsonl` + `fs.rmSync` 删 `<id>/subagents` 目录，并清 cache/INDEX/BLOBS/FAVS。
-- **不可恢复**。`POST /api/delete` 仅登录可用（`if (!authed)` 之后），**不接受分享 token**；前端二次 `confirm`。
+- **不可恢复**。`POST /api/delete` 仅管理员可用（`if (!authed)` 之后），**不接受分享 token**；前端二次 `confirm`。
 
 ## Android 壳子（`android/`）
 
@@ -140,6 +174,8 @@
   打 `v*` tag 自动出 APK 挂 Release，或手动 Run workflow 取 artifact。
 - 服务器地址存 SharedPreferences，首次启动进 `SetupActivity` 填写；
   长按返回键 / 桌面长按图标快捷方式可再改。壳内拦截 `app://settings`、`app://reload`。
+- WebChromeClient 实现了 `onShowFileChooser`（多选走 clipData）：不实现的话网页里所有
+  `<input type=file>`（文件页上传、对话框 📎）点了都没反应。
 - 签名：secrets 配了 `KEYSTORE_BASE64` 等四项就用固定签名，否则退回 debug 签名。
 
 ## 运行 / 调试

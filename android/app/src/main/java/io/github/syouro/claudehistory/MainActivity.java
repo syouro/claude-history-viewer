@@ -11,6 +11,7 @@ import android.text.InputType;
 import android.view.KeyEvent;
 import android.webkit.CookieManager;
 import android.webkit.HttpAuthHandler;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -29,6 +30,8 @@ public class MainActivity extends Activity {
     private WebView web;
     private String home = "";
     private boolean triedSavedAuth = false;
+    private ValueCallback<Uri[]> fileChooserCb; // 网页 <input type=file> 的回调
+    private static final int REQ_FILE = 1;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -49,7 +52,24 @@ public class MainActivity extends Activity {
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(web, true);
 
-        web.setWebChromeClient(new WebChromeClient());
+        // 裸 WebChromeClient 不实现 onShowFileChooser 的话，网页里所有 <input type=file>
+        // （文件页上传、对话框 📎）点了都没反应——这里接到系统文件选择器
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb,
+                                             FileChooserParams params) {
+                if (fileChooserCb != null) fileChooserCb.onReceiveValue(null);
+                fileChooserCb = cb;
+                try {
+                    startActivityForResult(params.createIntent()
+                            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true), REQ_FILE);
+                } catch (Exception e) {
+                    fileChooserCb = null;
+                    return false;
+                }
+                return true;
+            }
+        });
         web.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageStarted(WebView v, String url, Bitmap favicon) {
@@ -146,6 +166,28 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton(R.string.auth_cancel, (d, w) -> h.cancel())
                 .show();
+    }
+
+    @Override
+    protected void onActivityResult(int req, int result, Intent data) {
+        if (req == REQ_FILE) {
+            if (fileChooserCb == null) return;
+            Uri[] out = null;
+            // parseResult 只认单选；多选结果在 clipData 里，自己拆
+            if (result == RESULT_OK && data != null) {
+                if (data.getClipData() != null) {
+                    int n = data.getClipData().getItemCount();
+                    out = new Uri[n];
+                    for (int i = 0; i < n; i++) out[i] = data.getClipData().getItemAt(i).getUri();
+                } else if (data.getData() != null) {
+                    out = new Uri[]{data.getData()};
+                }
+            }
+            fileChooserCb.onReceiveValue(out); // 取消也要回调 null，不然下次选不了
+            fileChooserCb = null;
+            return;
+        }
+        super.onActivityResult(req, result, data);
     }
 
     @Override

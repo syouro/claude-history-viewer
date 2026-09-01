@@ -117,9 +117,47 @@ function parseCookies(req) {
   }
   return out;
 }
-function isAuthed(req) {
+// ---------- 子账号（accounts.json，手工编辑；仅只读 + 可选分享）----------
+// 形如 { "leader": { "password": "xxx", "projects": ["*HNLGDT*"], "share": true } }
+// projects 是项目目录名的 glob 白名单（与 exclude 同款语法）；不在名单里的项目
+// 对该账号完全不可见（列表 / 搜索 / 统计 / 会话都过滤）。share 允许生成分享链接。
+// 权限做成字段是为了以后好扩（比如给某账号开 tmux 对话），现在只有 share 一档。
+// 删除 accounts.json 里的账号即吊销其所有已登录会话（authOf 每次都查账号还在不在）。
+const ACCOUNTS_PATH = path.join(__dirname, 'accounts.json');
+const USER_RE = /^[A-Za-z0-9_-]{1,32}$/;
+let accountsCache = { stamp: -1, map: {} };
+function loadAccounts() {
+  let stamp = 0;
+  try { stamp = fs.statSync(ACCOUNTS_PATH).mtimeMs; } catch { /* 无账号文件 */ }
+  if (stamp === accountsCache.stamp) return accountsCache.map;
+  let map = {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(ACCOUNTS_PATH, 'utf8'));
+    for (const [u, a] of Object.entries(raw || {})) {
+      if (!USER_RE.test(u) || !a || typeof a.password !== 'string' || !a.password) continue;
+      map[u] = {
+        password: a.password,
+        projects: (Array.isArray(a.projects) ? a.projects : []).map(globToRe),
+        share: !!a.share,
+      };
+    }
+  } catch { map = {}; }
+  accountsCache = { stamp, map };
+  return map;
+}
+// 请求 → 登录身份：{admin:true} / {user, projects, share} / null（未登录或分享 token）
+function authOf(req) {
   const p = verifyToken(parseCookies(req)['chv_sid']);
-  return !!p && !p.sp; // 分享 token（带会话作用域）不能冒充登录会话
+  if (!p || p.sp) return null; // 分享 token（带会话作用域）不能冒充登录会话
+  if (!p.u) return { admin: true };
+  const a = loadAccounts()[p.u]; // 账号被删即失效
+  return a ? { admin: false, user: p.u, projects: a.projects, share: a.share } : null;
+}
+function isAuthed(req) { return !!authOf(req); }
+// 该身份能否看这个项目（排除规则对所有人生效；子账号再过 projects 白名单）
+function projAllowed(auth, project) {
+  if (!auth || isExcluded(project)) return false;
+  return auth.admin || auth.projects.some((re) => re.test(project));
 }
 
 // ---------- 登录限速 ----------
@@ -1002,7 +1040,7 @@ function summary(s) {
     usage: s.usage, usageByDay: s.usageByDay, msgsByDay: s.msgsByDay,
   };
 }
-function search(q, includeThinking, src) {
+function search(q, includeThinking, src, allow) {
   src = srcOf(src);
   const query = q.toLowerCase().trim();
   if (!query) return [];
@@ -1013,6 +1051,7 @@ function search(q, includeThinking, src) {
     const sum = e.summary;
     if ((sum.src || 'claude') !== src) continue;   // claude / codex 两页独立搜索
     if (isExcluded(sum.project)) continue;
+    if (allow && !allow(sum.project)) continue;    // 子账号的项目白名单
     const titleLc = (sum.title + ' ' + (sum.firstPrompt || '')).toLowerCase();
     const titleHit = terms.every((term) => titleLc.includes(term));
     // 粗筛：全部词都在正文（或含思考时并入思考）blob 里，才可能有精确命中
@@ -1104,6 +1143,41 @@ function toMarkdown(s) {
 // send-keys 翻译成按键注回 CLI。裸终端画面只作兜底视图。
 // /api/file 允许预览的扩展名（会话里 Write/Edit 产出的文档类文件；代码文件看工具块就够了）
 const FILE_EXTS = new Set(['.md', '.markdown', '.html', '.htm', '.svg', '.txt', '.json', '.csv', '.log']);
+
+// ---------- 文件区（/api/files*：上传 md/图片 + 在线编辑，仅管理员）----------
+// 与 /api/file 的只读预览不同：这里可写，但只在 files/ 这一个目录里打转——
+// 网页拿不到改盘上任意文件的能力（登录 cookie 泄露也只烧到这个目录）。
+const FILES_DIR = path.join(__dirname, 'files');
+const UP_TEXT = new Set(['.md', '.markdown', '.txt', '.json', '.csv', '.log',
+  '.html', '.htm', '.svg']); // 文本类：可在线编辑；html/svg 前端只进沙箱 iframe
+const UP_IMG = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp' }; // 图片：/api/files/raw 直出
+const UP_BIN = new Set(['.pdf']); // 其他二进制：只存和下载，不预览（agent 从盘上读）
+const UP_MAX = 10 * 1024 * 1024;
+// 文件名白名单：字母数字/CJK/常用括号/点横下划线空格，不许以点开头（防 .. 与隐藏文件）、
+// 不含路径分隔符 → path.join(FILES_DIR, name) 不会跳出目录
+function safeUpName(n) {
+  n = String(n || '').trim();
+  if (!n || n.length > 120 || n[0] === '.') return null;
+  if (!/^[\w.()（）【】一-鿿 -]+$/.test(n)) return null;
+  const ext = path.extname(n).toLowerCase();
+  if (!UP_TEXT.has(ext) && !UP_IMG[ext] && !UP_BIN.has(ext)) return null;
+  return n;
+}
+// 二进制请求体（上传用；readBody 是给小 JSON 的，上限太小且会把字节拼成字符串）
+function readBodyBuf(req, max) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let n = 0, dead = false;
+    req.on('data', (c) => {
+      n += c.length;
+      if (n > max) { dead = true; req.destroy(); resolve(null); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => { if (!dead) resolve(Buffer.concat(chunks)); });
+    req.on('error', () => { if (!dead) { dead = true; resolve(null); } });
+  });
+}
 const PANE_RE = /^%\d+$/; // 只接受 tmux pane id（如 %3），防注入 / 选项注入
 // send-keys 允许的具名按键白名单（文本走 -l 字面量通道，不查这个表）
 const TMUX_KEYS = new Set(['Enter', 'Escape', 'Tab', 'BTab', 'Up', 'Down', 'Left', 'Right',
@@ -1334,8 +1408,10 @@ function readBody(req) {
     req.on('error', () => resolve(''));
   });
 }
-function setSession(res) {
-  const tok = signToken({ exp: Date.now() + SESSION_TTL });
+function setSession(res, user) {
+  const payload = { exp: Date.now() + SESSION_TTL };
+  if (user) payload.u = user; // 子账号：token 带用户名；管理员 token 不带（老 cookie 兼容）
+  const tok = signToken(payload);
   const parts = ['chv_sid=' + tok, 'HttpOnly', 'SameSite=Lax', 'Path=' + COOKIE_PATH,
     'Max-Age=' + Math.floor(SESSION_TTL / 1000)];
   if (SECURE_COOKIE) parts.push('Secure');
@@ -1361,7 +1437,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/me') {
-      sendJSON(res, { authed: isAuthed(req), codex: CODEX_ENABLED, agy: AGY_ENABLED });
+      const a = authOf(req);
+      sendJSON(res, { authed: !!a, admin: !!(a && a.admin), user: (a && a.user) || '',
+        canShare: !!(a && (a.admin || a.share)),
+        codex: CODEX_ENABLED, agy: AGY_ENABLED });
       return;
     }
     if (p === '/api/login' && req.method === 'POST') {
@@ -1370,25 +1449,34 @@ const server = http.createServer(async (req, res) => {
       if (lock) { sendJSON(res, { error: '尝试过多，请 ' + lock + ' 秒后再试' }, 429); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
-      if (typeof body.password === 'string' && tsafeEqual(body.password, PASSWORD)) {
+      const user = typeof body.user === 'string' ? body.user.trim() : '';
+      if (!user && typeof body.password === 'string' && tsafeEqual(body.password, PASSWORD)) {
         recordOk(ip); setSession(res); sendJSON(res, { ok: true }); return;
+      }
+      const acc = user && USER_RE.test(user) ? loadAccounts()[user] : null;
+      if (acc && typeof body.password === 'string' && tsafeEqual(body.password, acc.password)) {
+        recordOk(ip); setSession(res, user); sendJSON(res, { ok: true }); return;
       }
       recordFail(ip);
       await new Promise((r) => setTimeout(r, 400)); // 拖慢暴力破解
-      sendJSON(res, { error: '密码错误' }, 401); return;
+      sendJSON(res, { error: user ? '用户名或密码错误' : '密码错误' }, 401); return;
     }
     if (p === '/api/logout') {
       res.setHeader('Set-Cookie', 'chv_sid=; Path=' + COOKIE_PATH + '; Max-Age=0');
       sendJSON(res, { ok: true }); return;
     }
 
-    // 鉴权：登录会话，或限定单个会话的只读分享 token（?share=）
-    const authed = isAuthed(req);
+    // 鉴权：登录会话（管理员或子账号，子账号按项目白名单过滤），
+    // 或限定单个会话的只读分享 token（?share=）
+    const auth = authOf(req);
+    const authed = !!auth;
+    const admin = !!(auth && auth.admin);
     const shareTok = url.searchParams.get('share');
     const share = shareTok ? verifyToken(shareTok) : null; // {sp, si, sr?, exp}
     const src = srcOf(url.searchParams.get('src')); // 数据源：claude（默认）| codex
     const canRead = (project, id) =>
-      authed || (!!share && share.sp === project && share.si === id && srcOf(share.sr) === src);
+      (auth && projAllowed(auth, project)) ||
+      (!!share && share.sp === project && share.si === id && srcOf(share.sr) === src);
 
     if (p === '/api/session') {
       const project = url.searchParams.get('project'), id = url.searchParams.get('id');
@@ -1442,8 +1530,11 @@ const server = http.createServer(async (req, res) => {
     // 以下均需登录
     if (!authed) { sendJSON(res, { error: 'unauthorized' }, 401); return; }
 
-    if (p === '/api/sessions') { sendJSON(res, listAll()); return; }
-    if (p === '/api/file') { // 文件渲染预览：读盘上当前内容（仅登录，不接受分享 token）
+    if (p === '/api/sessions') {
+      sendJSON(res, listAll().filter((s) => projAllowed(auth, s.project))); return;
+    }
+    if (p === '/api/file') { // 文件渲染预览：读盘上当前内容（仅管理员，不接受分享 token）
+      if (!admin) { sendJSON(res, { error: '仅管理员可用' }, 403); return; }
       const rawP = String(url.searchParams.get('path') || '');
       const fp = path.resolve(expandHome(rawP));
       const ext = path.extname(fp).toLowerCase();
@@ -1462,11 +1553,109 @@ const server = http.createServer(async (req, res) => {
       } catch { sendJSON(res, { error: '读不到文件：' + fp }, 404); }
       return;
     }
+    // ---- 文件区（上传 / 在线编辑，全部仅管理员；见 FILES_DIR 一节的注释）----
+    if (p === '/api/files' || p.startsWith('/api/files/')) {
+      if (!admin) { sendJSON(res, { error: '仅管理员可用' }, 403); return; }
+      if (p === '/api/files') { // 列表
+        let files = [];
+        try {
+          files = fs.readdirSync(FILES_DIR).map((n) => {
+            if (!safeUpName(n)) return null; // 目录里手工放的怪名文件不列（API 也操作不了）
+            const st = fs.statSync(path.join(FILES_DIR, n));
+            return st.isFile() ? { name: n, size: st.size, mtime: st.mtimeMs,
+              ext: path.extname(n).toLowerCase() } : null;
+          }).filter(Boolean);
+        } catch { /* 目录还没建 */ }
+        files.sort((a, b) => b.mtime - a.mtime);
+        sendJSON(res, { files }); return;
+      }
+      if (p === '/api/files/upload' && req.method === 'POST') { // 原始字节体，文件名在查询串
+        let name = safeUpName(url.searchParams.get('name'));
+        if (!name) {
+          sendJSON(res, { error: '文件名不合法或类型不支持（md/txt/图片/html/svg…）' }, 400); return;
+        }
+        const buf = await readBodyBuf(req, UP_MAX);
+        if (!buf) { sendJSON(res, { error: '文件太大（>10MB）或读取失败' }, 413); return; }
+        let fp = path.join(FILES_DIR, name);
+        if (fs.existsSync(fp)) {
+          if (url.searchParams.get('auto') === '1') { // 自动改名：加 -2、-3…（对话框贴图用）
+            const ext = path.extname(name), base = name.slice(0, name.length - ext.length);
+            for (let i = 2; fs.existsSync(fp); i++) {
+              name = base + '-' + i + ext;
+              fp = path.join(FILES_DIR, name);
+            }
+          } else if (url.searchParams.get('force') !== '1') {
+            sendJSON(res, { error: '已存在同名文件', exists: true }, 409); return;
+          }
+        }
+        fs.mkdirSync(FILES_DIR, { recursive: true });
+        fs.writeFileSync(fp, buf);
+        // path：盘上绝对路径，给对话输入框插进消息里（tmux 里的 CLI agent 直接可读）
+        sendJSON(res, { ok: true, name, path: fp }); return;
+      }
+      if (p === '/api/files/get') { // 文本内容（前端渲染 / 进编辑器）
+        const name = safeUpName(url.searchParams.get('name'));
+        const ext = name ? path.extname(name).toLowerCase() : '';
+        if (!name || !UP_TEXT.has(ext)) { sendJSON(res, { error: 'bad request' }, 400); return; }
+        try {
+          const fp = path.join(FILES_DIR, name);
+          const st = fs.statSync(fp);
+          if (st.size > UP_MAX) { sendJSON(res, { error: '文件太大' }, 413); return; }
+          sendJSON(res, { name, ext, size: st.size, mtime: st.mtimeMs,
+            content: fs.readFileSync(fp, 'utf8') });
+        } catch { sendJSON(res, { error: '读不到文件：' + name }, 404); }
+        return;
+      }
+      if (p === '/api/files/save' && req.method === 'POST') { // 保存文本（新建或覆盖）
+        const buf = await readBodyBuf(req, UP_MAX + 1024 * 1024); // JSON 转义后会胖一圈
+        let body = {};
+        try { body = JSON.parse(String(buf || '')); } catch { /* */ }
+        const name = safeUpName(body.name);
+        const ext = name ? path.extname(name).toLowerCase() : '';
+        if (!name || !UP_TEXT.has(ext) || typeof body.content !== 'string') {
+          sendJSON(res, { error: 'bad request' }, 400); return;
+        }
+        fs.mkdirSync(FILES_DIR, { recursive: true });
+        fs.writeFileSync(path.join(FILES_DIR, name), body.content);
+        sendJSON(res, { ok: true, name }); return;
+      }
+      if (p === '/api/files/delete' && req.method === 'POST') {
+        let body = {};
+        try { body = JSON.parse(await readBody(req)); } catch { /* */ }
+        const name = safeUpName(body.name);
+        if (!name) { sendJSON(res, { error: 'bad request' }, 400); return; }
+        try { fs.unlinkSync(path.join(FILES_DIR, name)); }
+        catch { sendJSON(res, { error: '读不到文件：' + name }, 404); return; }
+        sendJSON(res, { ok: true }); return;
+      }
+      if (p === '/api/files/raw') { // 图片直出（<img> 用）；dl=1 时任何类型按附件下载
+        const name = safeUpName(url.searchParams.get('name'));
+        if (!name) { sendJSON(res, { error: 'bad request' }, 400); return; }
+        const ext = path.extname(name).toLowerCase();
+        const dl = url.searchParams.get('dl') === '1';
+        // 非图片不给同源直出（html/svg 当文档打开能跑脚本拿 cookie），只能走附件下载
+        if (!UP_IMG[ext] && !dl) { sendJSON(res, { error: '该类型仅支持下载' }, 400); return; }
+        try {
+          const buf = fs.readFileSync(path.join(FILES_DIR, name));
+          const headers = { 'Content-Type': dl ? 'application/octet-stream' : UP_IMG[ext],
+            'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-cache' };
+          if (dl) headers['Content-Disposition'] =
+            "attachment; filename*=UTF-8''" + encodeURIComponent(name);
+          res.writeHead(200, headers); res.end(buf);
+        } catch { sendJSON(res, { error: '读不到文件：' + name }, 404); }
+        return;
+      }
+      sendJSON(res, { error: 'not found' }, 404); return;
+    }
     if (p === '/api/share' && req.method === 'POST') {
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
         sendJSON(res, { error: 'bad request' }, 400); return;
+      }
+      // 子账号：要有 share 权限，且只能分享自己看得到的项目
+      if (!admin && !(auth.share && projAllowed(auth, body.project))) {
+        sendJSON(res, { error: '此账号不能分享' }, 403); return;
       }
       const days = Math.min(30, Math.max(1, +body.days || 7));
       const exp = Date.now() + days * 86400e3;
@@ -1476,8 +1665,9 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, { token: signToken(tok), exp });
       return;
     }
-    if (p === '/api/favs') { sendJSON(res, FAVS); return; }
+    if (p === '/api/favs') { sendJSON(res, admin ? FAVS : {}); return; } // 收藏备注是管理员私有的
     if (p === '/api/fav' && req.method === 'POST') {
+      if (!admin) { sendJSON(res, { error: '仅管理员可用' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
@@ -1489,8 +1679,9 @@ const server = http.createServer(async (req, res) => {
       saveFavs();
       sendJSON(res, { ok: true, favs: FAVS }); return;
     }
-    // 删除会话：删掉磁盘上的 .jsonl（含子代理目录），仅登录可用、不接受分享 token
+    // 删除会话：删掉磁盘上的 .jsonl（含子代理目录），仅管理员、不接受分享 token
     if (p === '/api/delete' && req.method === 'POST') {
+      if (!admin) { sendJSON(res, { error: '仅管理员可用' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       if (!NAME_RE.test(body.project || '') || !NAME_RE.test(body.id || '')) {
@@ -1530,6 +1721,7 @@ const server = http.createServer(async (req, res) => {
       };
       for (const s of listAll()) {
         if ((s.src || 'claude') !== src) continue; // 两页统计独立
+        if (!projAllowed(auth, s.project)) continue; // 子账号只统计看得到的项目
         let hit = false;                          // 该会话在区间内是否有数据
         for (const [day, models] of Object.entries(s.usageByDay || {})) {
           bound(day);
@@ -1558,19 +1750,20 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/search') {
       const inc = url.searchParams.get('thinking') === '1';
-      sendJSON(res, search(url.searchParams.get('q') || '', inc, src)); return;
+      sendJSON(res, search(url.searchParams.get('q') || '', inc, src,
+        (pj) => projAllowed(auth, pj))); return;
     }
-    // ---- tmux 桥接（仅登录可用，不接受分享 token；默认关闭需显式开启）----
-    if (p === '/api/tmux') { // 窗格列表；未开启时回 enabled:false，前端据此隐藏入口
-      if (!TMUX_UI) { sendJSON(res, { enabled: false, panes: [] }); return; }
+    // ---- tmux 桥接（仅管理员，不接受分享 token；默认关闭需显式开启）----
+    if (p === '/api/tmux') { // 窗格列表；未开启/子账号时回 enabled:false，前端据此隐藏入口
+      if (!TMUX_UI || !admin) { sendJSON(res, { enabled: false, panes: [] }); return; }
       sendJSON(res, { enabled: true, panes: await tmuxPanes() }); return;
     }
     if (p === '/api/tmux/sys') { // 服务器状态 + 「还能再开几个 agent」估算（终端页状态条轮询）
-      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      if (!TMUX_UI || !admin) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       sendJSON(res, sysSnapshot(await tmuxPanes())); return;
     }
     if (p === '/api/tmux/pane') { // 抓屏 + 状态解析；lite=1 只回状态（会话控制条轮询用）
-      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      if (!TMUX_UI || !admin) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       const t = url.searchParams.get('t') || '';
       if (!PANE_RE.test(t)) { sendJSON(res, { error: 'bad target' }, 400); return; }
       let lines = +(url.searchParams.get('lines') || 200);
@@ -1590,7 +1783,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/tmux/send' && req.method === 'POST') { // 注入按键：文本走字面量，具名键过白名单
-      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      if (!TMUX_UI || !admin) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       const t = String(body.t || '');
@@ -1612,7 +1805,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/tmux/new' && req.method === 'POST') { // 新建会话：默认开 shell，可指定目录和启动命令
-      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      if (!TMUX_UI || !admin) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       const name = String(body.name || '').trim();
@@ -1643,7 +1836,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/tmux/kill' && req.method === 'POST') { // 关闭窗格（会话的最后一个窗格没了，会话随之结束）
-      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      if (!TMUX_UI || !admin) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       const t = String(body.t || '');
@@ -1653,7 +1846,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/tmux/resize' && req.method === 'POST') { // 调窗口尺寸：让 TUI 按网页可视区重排
-      if (!TMUX_UI) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
+      if (!TMUX_UI || !admin) { sendJSON(res, { error: 'tmux 桥接未开启' }, 403); return; }
       let body = {};
       try { body = JSON.parse(await readBody(req)); } catch { /* */ }
       const t = String(body.t || '');
@@ -1681,6 +1874,7 @@ const server = http.createServer(async (req, res) => {
 // 供 node:test 复用纯函数（被 require 时不启动服务器）
 module.exports = {
   globToRe, isExcluded, extractBlocks, toolResultText, plainText,
+  projAllowed, safeUpName, // 子账号项目白名单 / 文件区文件名白名单
   priceFor, costOf, parseSession, parseCodexSession, codexProject, parseAgySession, agyProject,
   searchBlobs, indexEntry,
   refreshIndex, listAll, search, loadSession, deleteSession, summary, INDEX,
@@ -1696,6 +1890,8 @@ if (require.main === module) {
     console.log('  扫描根目录：' + ROOTS.join('，'));
     if (EXCLUDE.length) console.log('  排除规则：' + (USER_CFG.exclude || []).join('，'));
     console.log('  tmux 桥接：' + (TMUX_UI ? '已开启（网页可向 tmux 会话发送按键）' : '未开启'));
+    const accs = Object.keys(loadAccounts());
+    if (accs.length) console.log('  子账号（accounts.json，只读）：' + accs.join('，'));
     console.log('  codex 历史：' + (CODEX_ENABLED ? CODEX_ROOTS.join('，') : '未启用'));
     console.log('  agy 历史：' + (AGY_ENABLED ? AGY_ROOTS.join('，') : '未启用'));
     if (generated) {
@@ -2001,6 +2197,27 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   font:12px/1.55 ui-monospace,Menlo,monospace;max-width:900px;margin:0 auto}
 #pvov .pvbody.raw{padding:0;display:flex}
 #pvov .pvbody.raw iframe{flex:1;border:0;width:100%;background:#fff}
+/* 文件区：图片预览 / 在线编辑器 */
+#pvov .pvbody.imgv{display:flex;align-items:center;justify-content:center}
+#pvov .pvbody.imgv img{max-width:100%;max-height:100%;object-fit:contain}
+#pvov .pvbody.edit{padding:0;display:flex}
+.edwrap{flex:1;display:flex;flex-direction:column;max-width:900px;margin:0 auto;
+  width:100%;padding:10px 14px;min-height:0}
+#fed{flex:1;resize:none;border:1px solid var(--line);border-radius:10px;background:var(--panel);
+  color:var(--ink);font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+  padding:12px;outline:none;min-height:200px}
+#fed:focus{border-color:var(--accent)}
+#edrender{flex:1;overflow:auto;border:1px solid var(--line);border-radius:10px;
+  background:var(--panel);padding:12px 16px}
+.edbar{display:flex;gap:8px;align-items:center;padding:8px 0 4px}
+.edbar button{border:1px solid var(--line);background:var(--field);color:var(--ink);
+  border-radius:9px;padding:7px 16px;font-size:13px;cursor:pointer}
+.edbar button:hover{border-color:var(--accent)}
+.edbar #edsave{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+#edmsg{margin-right:auto;font-size:12px;color:var(--muted)}
+.fdel{border:1px solid var(--line);background:var(--field);color:#d64545;border-radius:7px;
+  padding:1px 8px;font-size:11px;cursor:pointer;margin-left:auto}
+.fdel:hover{border-color:#d64545}
 #composer{display:none;border-top:1px solid var(--line);background:var(--panel);padding:8px 14px 6px}
 #composer.show{display:block}
 .crow{display:flex;gap:6px;align-items:flex-end;max-width:860px;margin:0 auto}
@@ -2081,6 +2298,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
   <div class="card">
     <h1><span class="dot"></span>Claude 对话历史</h1>
     <p>请输入访问密码</p>
+    <input id="lu" placeholder="用户名（管理员留空）" autocomplete="username">
     <input id="pw" type="password" placeholder="密码" autocomplete="current-password">
     <button id="loginBtn">进入</button>
     <div class="err" id="loginErr"></div>
@@ -2096,6 +2314,7 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <h1><span class="dot"></span>Claude 对话历史</h1>
       <div class="icons">
         <button class="iconbtn" id="termBtn" title="tmux 控制台" style="display:none">▣</button>
+        <button class="iconbtn" id="filesBtn" title="文件（上传 md / 图片，在线编辑）" style="display:none">📁</button>
         <button class="iconbtn" id="statsBtn" title="用量统计">📊</button>
         <button class="iconbtn" id="theme" title="切换深浅色">◐</button>
         <button class="iconbtn" id="logout" title="退出登录">⏻</button>
@@ -2151,12 +2370,16 @@ details.pack{background:var(--accent-soft);border-radius:8px;font-size:12.5px}
       <button class="ckey" data-k="Left" title="←">←</button>
       <button class="ckey" data-k="Right" title="→">→</button>
       <button class="ckey" data-k="Enter" title="回车确认">⏎</button>
+      <button class="ckey" id="cattach" title="上传图片/文件到文件区，把路径填进输入框">📎</button>
+      <input type="file" id="cfile" multiple style="display:none">
       <button id="cterm" title="打开终端画面">▣</button>
     </div>
     <div class="ctarget" id="ctarget"></div>
   </div>
   <div id="pvov">
     <div class="pvbar"><b id="pvname"></b><span class="mono" id="pvpath"></span>
+      <button id="pved" title="编辑" style="display:none">✎ 编辑</button>
+      <button id="pvdl" title="下载" style="display:none">⇩</button>
       <button id="pvre" title="重新从磁盘读取">↻</button><button id="pvx" title="关闭（Esc）">✕</button></div>
     <div class="pvbody" id="pvbody"></div>
   </div>
